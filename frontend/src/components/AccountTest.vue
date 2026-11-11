@@ -121,7 +121,7 @@ function stop() {
         <p v-if="'message' in result && result.message" class="whitespace-pre-wrap break-words text-z-sm">
           {{ result.message }}
         </p>
-        <div v-for="(outbound, index) in result.outbound" :key="index" class="space-y-3 rounded-z border border-z-border p-3">
+        <div v-for="(outbound, index) in result.outbound" :key="index" class="space-y-3 rounded-z bg-z-fill-alter p-4">
           <div class="flex flex-wrap items-center justify-between gap-2 text-z-sm">
             <span>本插件覆写后的请求头</span>
             <ZTag size="small" type="info">

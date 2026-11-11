@@ -21,6 +21,27 @@ const testerOpen = shallowRef(false)
 const modalOpen = computed(() => editorOpen.value || testerOpen.value)
 const notice = shallowRef('')
 const rows = computed(() => snapshot.value?.accounts ?? [])
+const metrics = computed(() => [
+  {
+    label: '本页账号',
+    value: snapshot.value ? rows.value.length : '—',
+    color: 'text-z-primary',
+  },
+  {
+    label: '账号已启用',
+    value: snapshot.value
+      ? rows.value.filter(row => row.enabled).length
+      : '—',
+    color: 'text-z-text',
+  },
+  {
+    label: '已开启覆写',
+    value: snapshot.value
+      ? rows.value.filter(row => row.override_enabled).length
+      : '—',
+    color: 'text-z-success',
+  },
+])
 const columns: TableColumn<Account>[] = [
   {
     key: 'name',
@@ -126,8 +147,24 @@ function saved(value: RuleSnapshot) {
     <main class="space-y-4 text-z-text" :class="{ 'overflow-clip': modalOpen }" :style="modalOpen ? { maxHeight: 'var(--plugin-viewport-height, 100dvh)' } : undefined">
       <RuleEditor v-model="editorOpen" :account="selected" @saved="saved" />
       <AccountTest v-model="testerOpen" :account="selected" />
-      <ZCard>
-        <form class="flex flex-wrap items-center gap-3" @submit.prevent="query">
+      <section aria-label="账号规则概览" class="grid grid-cols-3 gap-2 sm:gap-4">
+        <ZCard v-for="metric in metrics" :key="metric.label">
+          <p class="text-z-xs text-z-text-secondary sm:text-z-sm">
+            {{ metric.label }}
+          </p>
+          <p class="mt-1 text-2xl font-emphasis tabular-nums" :class="metric.color">
+            {{ metric.value }}
+          </p>
+        </ZCard>
+      </section>
+      <ZCard class="min-w-0">
+        <div class="mb-3 flex flex-wrap items-baseline justify-between gap-2">
+          <h2 class="text-z-base font-emphasis">
+            账号规则
+          </h2>
+          <span class="text-z-xs text-z-text-secondary">测试可查看覆写前后的请求头</span>
+        </div>
+        <form class="mb-4 flex flex-wrap items-center gap-2" @submit.prevent="query">
           <ZInput v-model="search" aria-label="搜索账号" placeholder="账号名称、邮箱或 ID" maxlength="256" class="w-full sm:max-w-96" />
           <ZButton type="primary" native-type="submit" :disabled="loading || modalOpen">
             查询
@@ -136,11 +173,6 @@ function saved(value: RuleSnapshot) {
             刷新
           </ZButton>
         </form>
-        <p class="mt-3 text-z-sm text-z-text-secondary">
-          点击“测试”可查看此账号在普通模型链路中覆写前后的请求头
-        </p>
-      </ZCard>
-      <ZCard>
         <div v-if="error" role="alert" class="mb-4 flex flex-wrap items-center gap-3 rounded-z bg-z-error-container p-3 text-z-error-on-container">
           <span>{{ error }}</span>
           <ZButton size="small" :disabled="loading" @click="load(page)">
@@ -152,12 +184,17 @@ function saved(value: RuleSnapshot) {
         </p>
         <ZTable :columns="columns" :data="rows" row-key="account_id" :loading="loading" size="small">
           <template #name="{ row }">
-            <div class="space-y-1">
-              <div class="truncate font-emphasis" :title="row.name || row.account_id">
-                {{ row.name || row.account_id }}
-              </div>
-              <div class="truncate text-z-xs text-z-text-secondary" :title="row.email || row.account_id">
-                {{ row.email || row.account_id }}
+            <div class="flex min-w-0 items-center gap-3">
+              <span aria-hidden="true" class="grid size-8 shrink-0 place-items-center rounded-z bg-z-primary-container font-emphasis text-z-primary-on-container">
+                {{ (row.name || row.email || row.account_id).slice(0, 1).toUpperCase() }}
+              </span>
+              <div class="min-w-0 space-y-1">
+                <div class="truncate font-emphasis" :title="row.name || row.account_id">
+                  {{ row.name || row.account_id }}
+                </div>
+                <div class="truncate text-z-xs text-z-text-secondary" :title="row.email || row.account_id">
+                  {{ row.email || row.account_id }}
+                </div>
               </div>
             </div>
           </template>
