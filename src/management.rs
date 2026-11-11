@@ -22,10 +22,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, from_slice, json, to_value, to_vec};
 
 use crate::{
+    diagnostics::Diagnostics,
     host_json,
     store::{self, Snapshot},
-    test_settings,
-    testing::Tests,
 };
 
 /// 列表只公开规则状态与数量，头值由编辑接口按账号读取
@@ -46,12 +45,11 @@ pub(crate) fn registration() -> ManagementRegistration {
             ("GET", "accounts"),
             ("GET", "rule"),
             ("POST", "rule"),
-            ("POST", "test"),
-            ("POST", "test/cancel"),
-            ("POST", "test/finish"),
-            ("GET", "test"),
-            ("GET", "test/settings"),
-            ("POST", "test/settings"),
+            ("GET", "diagnostics/status"),
+            ("POST", "diagnostics/register"),
+            ("POST", "diagnostics/cancel"),
+            ("POST", "diagnostics/finish"),
+            ("GET", "diagnostics/result"),
         ]
         .into_iter()
         .map(|(method, path)| ManagementRoute {
@@ -85,11 +83,11 @@ pub(crate) fn registration() -> ManagementRegistration {
 
 /// 处理宿主已认证的管理请求，错误正文保持中文且不回显头值
 /// @param call 当前管理员调用及原始正文
-/// @param tests 当前进程共享的测试取消登记
+/// @param tests 当前进程的短期出站诊断关联
 /// @return JSON 业务正文或明确的错误状态
 pub(crate) async fn handle(
     call: TypedCall<ManagementRequest>,
-    tests: Tests,
+    tests: Diagnostics,
 ) -> Result<TypedReply<ManagementResponse>, PluginFault> {
     let (status, value) = match route(&call, &tests).await {
         Ok(value) => (200, value),
@@ -104,13 +102,13 @@ pub(crate) async fn handle(
             };
             let message = match error.code {
                 ErrorCode::Conflict | ErrorCode::Cancelled | ErrorCode::Timeout
-                    if call.request.path.starts_with("test") =>
+                    if call.request.path.starts_with("diagnostics") =>
                 {
                     &error.message
                 }
                 ErrorCode::Conflict => "规则已被其他页面更新，请重新读取后编辑",
                 ErrorCode::InvalidInput => &error.message,
-                _ if call.request.path.starts_with("test") => "测试资源准备失败",
+                _ if call.request.path.starts_with("diagnostics") => "诊断操作失败",
                 _ => "账号请求头操作失败，请重新读取确认当前规则",
             };
             (
@@ -132,7 +130,10 @@ pub(crate) async fn handle(
     ))
 }
 
-async fn route(call: &TypedCall<ManagementRequest>, tests: &Tests) -> Result<Value, PluginFault> {
+async fn route(
+    call: &TypedCall<ManagementRequest>,
+    tests: &Diagnostics,
+) -> Result<Value, PluginFault> {
     let mut query = BTreeMap::new();
     for (key, value) in parse(call.request.query.as_bytes()).into_owned() {
         if query.insert(key, value).is_some() {
@@ -140,15 +141,6 @@ async fn route(call: &TypedCall<ManagementRequest>, tests: &Tests) -> Result<Val
         }
     }
     match (call.request.method.as_str(), call.request.path.as_str()) {
-        ("GET", "test/settings") if query.is_empty() => {
-            let (settings, groups) = tokio::try_join!(
-                test_settings::load(&call.host),
-                test_settings::groups(&call.host)
-            )?;
-            Ok(json!({"settings":settings,"groups":groups}))
-        }
-        ("POST", "test/settings") if query.is_empty() => tests.save_settings(call).await,
-
         ("GET", "accounts") if query.keys().all(|key| key == "cursor" || key == "search") => {
             accounts(
                 call,
@@ -170,10 +162,11 @@ async fn route(call: &TypedCall<ManagementRequest>, tests: &Tests) -> Result<Val
             }
             to_value(store::save(&call.host, input).await?).map_err(|_| invalid())
         }
-        ("POST", "test") if query.is_empty() => tests.prepare(call).await,
-        ("POST", "test/cancel") if query.is_empty() => tests.end(call, true),
-        ("POST", "test/finish") if query.is_empty() => tests.end(call, false),
-        ("GET", "test") if query.len() == 2 => tests.result(
+        ("GET", "diagnostics/status") if query.is_empty() => Ok(json!({"version":1})),
+        ("POST", "diagnostics/register") if query.is_empty() => tests.register(call),
+        ("POST", "diagnostics/cancel") if query.is_empty() => tests.end(call, true),
+        ("POST", "diagnostics/finish") if query.is_empty() => tests.end(call, false),
+        ("GET", "diagnostics/result") if query.len() == 2 => tests.result(
             &query.remove("id").ok_or_else(invalid)?,
             &query.remove("requestId").ok_or_else(invalid)?,
         ),
@@ -238,20 +231,24 @@ fn invalid() -> PluginFault {
     PluginFault::new(ErrorCode::InvalidInput, "请求参数无效")
 }
 
-/// 账号列表展示当前所属分组，名称缺失时保留稳定分组 ID
+/// 账号列表的分组采用原生管理列表的完整成员关系
 /// @param host 当前管理调用的受管客户端
-/// @param entries 当前页账号及其宿主分组 ID
-/// @return 原地补齐各账号的当前分组名称
+/// @param entries 当前页账号及 SDK 基础事实
+/// @return 原地补齐已确认的分组 ID 与名称，读取失败保留已有事实
 async fn add_group_names(host: &HostClient, entries: &mut [AccountEntry]) {
     #[derive(Deserialize)]
     struct Group {
         id: String,
         name: String,
     }
-    /// 分组选择项使用管理 API 的分页信封
+    #[derive(Deserialize)]
+    struct Account {
+        id: String,
+        groups: Vec<Group>,
+    }
     #[derive(Deserialize)]
     struct Page {
-        items: Vec<Group>,
+        items: Vec<Account>,
         page: Pagination,
     }
     #[derive(Deserialize)]
@@ -260,30 +257,30 @@ async fn add_group_names(host: &HostClient, entries: &mut [AccountEntry]) {
     }
     let mut needed: BTreeSet<_> = entries
         .iter()
-        .flat_map(|e| e.account.group_ids.iter().cloned())
+        .map(|e| e.account.account_id.clone())
         .collect();
-    let mut names = BTreeMap::new();
+    let mut memberships = BTreeMap::new();
     let lookup = async {
         let mut page = 1_u64;
         while !needed.is_empty() {
             let Some(value) = host_json::get(
                 host,
-                format!("/api/admin/account-groups/options?page={page}&pageSize=100"),
+                format!("/api/admin/accounts?page={page}&pageSize=100"),
             )
             .await
             else {
                 break;
             };
-            let Ok(groups) = serde_json::from_value::<Page>(value) else {
+            let Ok(accounts) = serde_json::from_value::<Page>(value) else {
                 break;
             };
-            let empty = groups.items.is_empty();
-            for group in groups.items {
-                if needed.remove(&group.id) && !group.name.trim().is_empty() {
-                    names.insert(group.id, group.name);
+            let empty = accounts.items.is_empty();
+            for account in accounts.items {
+                if needed.remove(&account.id) {
+                    memberships.insert(account.id, account.groups);
                 }
             }
-            if empty || page.saturating_mul(100) >= groups.page.total {
+            if empty || page.saturating_mul(100) >= accounts.page.total {
                 break;
             }
             page += 1;
@@ -291,11 +288,20 @@ async fn add_group_names(host: &HostClient, entries: &mut [AccountEntry]) {
     };
     let _ = tokio::time::timeout(Duration::from_secs(2), lookup).await;
     for entry in entries {
-        entry.group_names = entry
-            .account
-            .group_ids
-            .iter()
-            .map(|id| names.get(id).unwrap_or(id).clone())
-            .collect();
+        if let Some(groups) = memberships.remove(&entry.account.account_id) {
+            entry.account.group_ids = groups.iter().map(|g| g.id.clone()).collect();
+            entry.group_names = groups
+                .into_iter()
+                .map(|g| {
+                    if g.name.trim().is_empty() {
+                        g.id
+                    } else {
+                        g.name
+                    }
+                })
+                .collect();
+        } else {
+            entry.group_names = entry.account.group_ids.clone();
+        }
     }
 }

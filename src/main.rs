@@ -1,19 +1,15 @@
 //! 启动独立进程，组合账号出站覆写和扩展页管理能力
 
+mod diagnostics;
 mod host_json;
 mod management;
 mod store;
-mod test_settings;
-mod testing;
 
 use std::error::Error;
 
 use gateway_plugin_sdk::{
     Manifest, PluginFault,
-    client::{
-        OutboundCall, OutboundRequest, PluginBuilder, PluginSession, SessionConfig, TypedReply,
-        methods,
-    },
+    client::{OutboundCall, OutboundRequest, PluginBuilder, PluginSession, SessionConfig},
 };
 
 #[tokio::main(flavor = "current_thread")]
@@ -30,20 +26,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         return Err("插件握手身份不匹配".into());
     }
-    let tests = testing::Tests::default();
+    let tests = diagnostics::Diagnostics::default();
     let outbound_tests = tests.clone();
-    let route_tests = tests.clone();
-    let schedule_tests = tests.clone();
     let plugin = PluginBuilder::from_json(include_bytes!("../plugin.json"))?
         .middleware(move |call| outbound(call, outbound_tests.clone()))?
-        .on(methods::ROUTE_MODEL, move |call| {
-            let decision = route_tests.route(&call);
-            async move { Ok(TypedReply::new(decision)) }
-        })?
-        .on(methods::SCHEDULE_ACCOUNT, move |call| {
-            let decision = schedule_tests.schedule(&call.request);
-            async move { Ok(TypedReply::new(decision)) }
-        })?
         .management(management::registration(), move |call| {
             management::handle(call, tests.clone())
         })?
@@ -58,7 +44,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 /// @return 正文与目标保持原样的准备请求
 async fn outbound(
     call: OutboundCall,
-    tests: testing::Tests,
+    tests: diagnostics::Diagnostics,
 ) -> Result<OutboundRequest, PluginFault> {
     let test = tests.target(&call.metadata, &call.request.body)?;
     let snapshot = store::load(&call.host, call.metadata.account_id.clone())

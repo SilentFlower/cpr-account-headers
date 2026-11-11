@@ -5,9 +5,7 @@ import { ZButton, ZCard, ZConfigProvider, ZEmpty, ZInput, ZTable, ZTag } from '@
 import { zhHans } from '@codex-proxy/ui/locale'
 import { computed, onBeforeUnmount, shallowRef } from 'vue'
 import { listAccounts } from './api/modules/headers'
-import AccountTest from './components/AccountTest.vue'
 import RuleEditor from './components/RuleEditor.vue'
-import TestSettings from './components/TestSettings.vue'
 
 const snapshot = shallowRef<AccountPage>()
 const loading = shallowRef(false)
@@ -18,9 +16,7 @@ const cursors = shallowRef<(string | null)[]>([null])
 const page = shallowRef(0)
 const selected = shallowRef<Account>()
 const editorOpen = shallowRef(false)
-const testerOpen = shallowRef(false)
-const settingsOpen = shallowRef(false)
-const modalOpen = computed(() => editorOpen.value || testerOpen.value || settingsOpen.value)
+const modalOpen = computed(() => editorOpen.value)
 const notice = shallowRef('')
 const rows = computed(() => snapshot.value?.accounts ?? [])
 const metrics = computed(() => [
@@ -127,11 +123,6 @@ function edit(account: Account) {
   editorOpen.value = true
   notice.value = ''
 }
-function test(account: Account) {
-  selected.value = account
-  testerOpen.value = true
-  notice.value = ''
-}
 function saved(value: RuleSnapshot) {
   if (snapshot.value) {
     snapshot.value = {
@@ -149,8 +140,6 @@ function saved(value: RuleSnapshot) {
   <ZConfigProvider :locale="zhHans">
     <main class="space-y-4 text-z-text" :class="{ 'overflow-clip': modalOpen }" :style="modalOpen ? { maxHeight: 'var(--plugin-viewport-height, 100dvh)' } : undefined">
       <RuleEditor v-model="editorOpen" :account="selected" @saved="saved" />
-      <AccountTest v-model="testerOpen" :account="selected" />
-      <TestSettings v-model="settingsOpen" @saved="notice = '测试设置已保存'" />
       <section aria-label="账号规则概览" class="grid grid-cols-3 gap-2 sm:gap-4">
         <ZCard v-for="metric in metrics" :key="metric.label">
           <p class="text-z-xs text-z-text-secondary sm:text-z-sm">
@@ -166,17 +155,14 @@ function saved(value: RuleSnapshot) {
           <h2 class="text-z-base font-emphasis">
             账号规则
           </h2>
-          <span class="text-z-xs text-z-text-secondary">测试可查看覆写前后的请求头</span>
+          <span class="text-z-xs text-z-text-secondary">定向测试请使用「账号请求头检测」插件</span>
         </div>
         <form class="mb-4 flex flex-wrap items-center gap-2" @submit.prevent="query">
           <ZInput v-model="search" aria-label="搜索账号" placeholder="账号名称、邮箱或 ID" maxlength="256" class="w-full sm:max-w-96" />
           <ZButton type="primary" native-type="submit" :disabled="loading || modalOpen">
             查询
           </ZButton>
-          <ZButton :disabled="modalOpen" class="sm:ml-auto" @click="settingsOpen = true">
-            测试设置
-          </ZButton>
-          <ZButton :loading="loading" :disabled="modalOpen" @click="load(page)">
+          <ZButton :loading="loading" :disabled="modalOpen" class="sm:ml-auto" @click="load(page)">
             刷新
           </ZButton>
         </form>
@@ -221,9 +207,6 @@ function saved(value: RuleSnapshot) {
           <template #actions="{ row }">
             <ZButton variant="link" size="small" :aria-label="`编辑 ${row.name || row.account_id}`" :disabled="loading || modalOpen" @click="edit(row)">
               编辑
-            </ZButton>
-            <ZButton variant="link" size="small" :aria-label="`测试 ${row.name || row.account_id}`" :disabled="loading || modalOpen" @click="test(row)">
-              测试
             </ZButton>
           </template>
           <template #empty>
