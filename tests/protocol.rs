@@ -1,6 +1,10 @@
 //! 运行真实插件子进程，验证管理桥合同、账号隔离、持久状态与错误及取消
 
-use std::{collections::HashMap, process::Stdio, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    process::Stdio,
+    time::Duration,
+};
 
 use gateway_plugin_sdk::{
     CallContext, ErrorCode, Frame, Handshake, Manifest, Message, PluginFault, Stage,
@@ -30,6 +34,8 @@ struct Host {
     resource_calls: usize,
     extra_member: bool,
     changed_key_scope: bool,
+    http_bodies: HashMap<String, VecDeque<Vec<u8>>>,
+    fail_groups: bool,
 }
 
 impl Host {
@@ -54,6 +60,8 @@ impl Host {
             resource_calls: 0,
             extra_member: false,
             changed_key_scope: false,
+            http_bodies: HashMap::new(),
+            fail_groups: false,
         };
         let manifest = Manifest::from_author_slice(include_bytes!("../plugin.json")).unwrap();
         host.send(
@@ -175,10 +183,37 @@ impl Host {
                             let second = query["cursor"] == "next-page";
                             payload = serde_json::to_vec(&json!({"schema_version":1,"accounts":[{
                                 "account_id":if second {OTHER} else {ACCOUNT},"provider_id":"openai","name":"测试账号","email":null,
-                                "enabled":true,"group_ids":if second && self.extra_member {vec!["grp_11111111111111111111111111111111"]} else {vec![]},"updated_at_ms":0
+                                "enabled":true,"group_ids":if second && self.extra_member {vec!["grp_11111111111111111111111111111111"]} else if !second {vec!["group-main","group-missing"]} else {vec![]},"updated_at_ms":0
                             }],"next_cursor":if second {None} else {Some("next-page")}})).unwrap();
                             Ok(json!({}))
                         }
+                        "host.http.dispatch" => {
+                            assert_eq!(params["method"], "GET");
+                            let uri = params["uri"].as_str().unwrap();
+                            assert!(uri.starts_with("/api/admin/account-groups/options?"));
+                            let second = uri.contains("page=2&");
+                            let status = if self.fail_groups { 503 } else { 200 };
+                            let data = json!({"items":if second {json!([{"id":"group-main","name":"当前 VIP"}])} else {json!([{"id":"unrelated","name":"其他组"}])},"page":{"page":if second {2} else {1},"pageSize":100,"total":101,"totalPages":2}});
+                            let bytes =
+                                serde_json::to_vec(&json!({"code":status,"data":data})).unwrap();
+                            let handle = format!("groups-{id}");
+                            self.http_bodies
+                                .insert(handle.clone(), VecDeque::from([bytes]));
+                            Ok(
+                                json!({"status":status,"version":"HTTP/1.1","headers":[],"body":{"kind":"handle","handle":handle},"response":null,"session":false}),
+                            )
+                        }
+                        "host.http.body_read" => {
+                            let bytes = self
+                                .http_bodies
+                                .get_mut(params["handle"].as_str().unwrap())
+                                .unwrap()
+                                .pop_front();
+                            let eof = bytes.is_none();
+                            payload = bytes.unwrap_or_default();
+                            Ok(json!({"eof":eof,"trailers":null}))
+                        }
+                        "host.http.body_close" => Ok(json!({})),
                         "host.groups.ensure"
                         | "host.groups.change_members"
                         | "host.keys.ensure"
@@ -292,6 +327,17 @@ async fn management_and_account_rules_survive_process_restart() {
     assert_eq!(page["accounts"].as_array().unwrap().len(), 2);
     assert_eq!(page["accounts"][0]["override_enabled"], false);
     assert_eq!(page["accounts"][0]["header_count"], 0);
+    assert_eq!(
+        page["accounts"][0]["group_names"],
+        json!(["当前 VIP", "group-missing"])
+    );
+    host.fail_groups = true;
+    let (_, fallback) = host.management("GET", "accounts", "", Value::Null).await;
+    assert_eq!(
+        fallback["accounts"][0]["group_names"],
+        json!(["group-main", "group-missing"])
+    );
+    host.fail_groups = false;
     let (_, page) = host
         .management("GET", "accounts", "cursor=next-page", Value::Null)
         .await;

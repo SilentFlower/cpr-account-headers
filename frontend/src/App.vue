@@ -49,6 +49,7 @@ const columns: TableColumn<Account>[] = [
     kind: 'identity',
     minWidth: 260,
   },
+  { key: 'group_names', label: '所属分组', minWidth: 160 },
   { key: 'provider_id', label: '平台', minWidth: 90 },
   {
     key: 'enabled',
@@ -197,6 +198,9 @@ function saved(value: RuleSnapshot) {
                 </div>
               </div>
             </div>
+          </template>
+          <template #group_names="{ row }">
+            <span class="block truncate text-z-xs" :title="row.group_names.join('、') || '未分组'">{{ row.group_names.join('、') || '未分组' }}</span>
           </template>
           <template #enabled="{ row }">
             <ZTag :type="row.enabled ? 'success' : 'info'" size="small">

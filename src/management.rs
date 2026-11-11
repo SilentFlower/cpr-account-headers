@@ -1,6 +1,9 @@
 //! 为隔离扩展页提供账号分页和按账号保存的请求头规则
 
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use form_urlencoded::parse;
 use gateway_plugin_sdk::{
@@ -13,12 +16,13 @@ use gateway_plugin_sdk::{
         },
         middleware::MiddlewareHeader,
     },
-    client::{TypedCall, TypedReply},
+    client::{HostClient, TypedCall, TypedReply},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, from_slice, json, to_value, to_vec};
 
 use crate::{
+    host_json,
     store::{self, Snapshot},
     testing::Tests,
 };
@@ -28,6 +32,7 @@ use crate::{
 struct AccountEntry {
     #[serde(flatten)]
     account: AccountFacts,
+    group_names: Vec<String>,
     override_enabled: bool,
     header_count: usize,
 }
@@ -197,11 +202,13 @@ async fn accounts(
             }
             // 多读一个匹配账号确认下一页，只为当前展示的账号读取规则
             if entries.len() == 20 {
+                add_group_names(&call.host, &mut entries).await;
                 let next_cursor = &entries[19].account.account_id;
                 return Ok(json!({"accounts":entries,"next_cursor":next_cursor}));
             }
             let snapshot = store::load(&call.host, account.account_id.clone()).await?;
             entries.push(AccountEntry {
+                group_names: Vec::new(),
                 account,
                 override_enabled: snapshot.rule.enabled,
                 header_count: snapshot.rule.headers.len(),
@@ -209,6 +216,7 @@ async fn accounts(
         }
         cursor = page.next_cursor;
         if cursor.is_none() {
+            add_group_names(&call.host, &mut entries).await;
             return Ok(json!({"accounts":entries,"next_cursor":null}));
         }
     }
@@ -216,4 +224,66 @@ async fn accounts(
 
 fn invalid() -> PluginFault {
     PluginFault::new(ErrorCode::InvalidInput, "请求参数无效")
+}
+
+/// 账号列表展示当前所属分组，名称缺失时保留稳定分组 ID
+/// @param host 当前管理调用的受管客户端
+/// @param entries 当前页账号及其宿主分组 ID
+/// @return 原地补齐各账号的当前分组名称
+async fn add_group_names(host: &HostClient, entries: &mut [AccountEntry]) {
+    #[derive(Deserialize)]
+    struct Group {
+        id: String,
+        name: String,
+    }
+    /// 分组选择项使用管理 API 的分页信封
+    #[derive(Deserialize)]
+    struct Page {
+        items: Vec<Group>,
+        page: Pagination,
+    }
+    #[derive(Deserialize)]
+    struct Pagination {
+        total: u64,
+    }
+    let mut needed: BTreeSet<_> = entries
+        .iter()
+        .flat_map(|e| e.account.group_ids.iter().cloned())
+        .collect();
+    let mut names = BTreeMap::new();
+    let lookup = async {
+        let mut page = 1_u64;
+        while !needed.is_empty() {
+            let Some(value) = host_json::get(
+                host,
+                format!("/api/admin/account-groups/options?page={page}&pageSize=100"),
+            )
+            .await
+            else {
+                break;
+            };
+            let Ok(groups) = serde_json::from_value::<Page>(value) else {
+                break;
+            };
+            let empty = groups.items.is_empty();
+            for group in groups.items {
+                if needed.remove(&group.id) && !group.name.trim().is_empty() {
+                    names.insert(group.id, group.name);
+                }
+            }
+            if empty || page.saturating_mul(100) >= groups.page.total {
+                break;
+            }
+            page += 1;
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(2), lookup).await;
+    for entry in entries {
+        entry.group_names = entry
+            .account
+            .group_ids
+            .iter()
+            .map(|id| names.get(id).unwrap_or(id).clone())
+            .collect();
+    }
 }

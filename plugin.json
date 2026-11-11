@@ -3,7 +3,7 @@
   "publisher": "silentflower",
   "name": "account-headers",
   "displayName": "账号请求头",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "按账号自定义覆写模型上游请求头",
   "license": "Apache-2.0",
   "engines": { "codex-proxy-rs": ">=3.43.0" },

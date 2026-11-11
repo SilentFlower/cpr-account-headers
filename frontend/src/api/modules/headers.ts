@@ -6,6 +6,8 @@ export interface Account {
   provider_id: string
   name: string
   email: string | null
+  group_ids: string[]
+  group_names: string[]
   enabled: boolean
   override_enabled: boolean
   header_count: number
@@ -63,6 +65,7 @@ export async function saveRule(input: RuleSnapshot): Promise<RuleSnapshot> {
 
 function isAccount(value: unknown): value is Account {
   return isObject(value) && ['account_id', 'provider_id', 'name'].every(key => typeof value[key] === 'string')
+    && [value.group_ids, value.group_names].every(groups => Array.isArray(groups) && groups.every(group => typeof group === 'string'))
     && (value.email === null || typeof value.email === 'string') && typeof value.enabled === 'boolean'
     && typeof value.override_enabled === 'boolean' && Number.isSafeInteger(value.header_count) && Number(value.header_count) >= 0
 }

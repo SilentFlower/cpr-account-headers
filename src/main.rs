@@ -1,5 +1,6 @@
 //! 启动独立进程，组合账号出站覆写和扩展页管理能力
 
+mod host_json;
 mod management;
 mod store;
 mod testing;
