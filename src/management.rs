@@ -18,7 +18,10 @@ use gateway_plugin_sdk::{
 use serde::Serialize;
 use serde_json::{Value, from_slice, json, to_value, to_vec};
 
-use crate::store::{self, Snapshot};
+use crate::{
+    store::{self, Snapshot},
+    testing::Tests,
+};
 
 /// 列表只公开规则状态与数量，头值由编辑接口按账号读取
 #[derive(Serialize)]
@@ -33,19 +36,25 @@ struct AccountEntry {
 /// @return 与作者清单一致的管理注册
 pub(crate) fn registration() -> ManagementRegistration {
     ManagementRegistration {
-        routes: [("GET", "accounts"), ("GET", "rule"), ("POST", "rule")]
-            .into_iter()
-            .map(|(method, path)| ManagementRoute {
-                method: method.into(),
-                path: path.into(),
-                request_content_types: if method == "POST" {
-                    vec!["application/json".into()]
-                } else {
-                    Vec::new()
-                },
-                response_content_types: vec!["application/json".into()],
-            })
-            .collect(),
+        routes: [
+            ("GET", "accounts"),
+            ("GET", "rule"),
+            ("POST", "rule"),
+            ("POST", "test"),
+            ("POST", "test/cancel"),
+        ]
+        .into_iter()
+        .map(|(method, path)| ManagementRoute {
+            method: method.into(),
+            path: path.into(),
+            request_content_types: if method == "POST" {
+                vec!["application/json".into()]
+            } else {
+                Vec::new()
+            },
+            response_content_types: vec!["application/json".into()],
+        })
+        .collect(),
         resources: ["web/index.html", "web/app.js", "web/app.css"]
             .into_iter()
             .map(|path| ManagementResource {
@@ -66,11 +75,13 @@ pub(crate) fn registration() -> ManagementRegistration {
 
 /// 处理宿主已认证的管理请求，错误正文保持中文且不回显头值
 /// @param call 当前管理员调用及原始正文
+/// @param tests 当前进程共享的测试取消登记
 /// @return JSON 业务正文或明确的错误状态
 pub(crate) async fn handle(
     call: TypedCall<ManagementRequest>,
+    tests: Tests,
 ) -> Result<TypedReply<ManagementResponse>, PluginFault> {
-    let (status, value) = match route(&call).await {
+    let (status, value) = match route(&call, &tests).await {
         Ok(value) => (200, value),
         Err(error) => {
             let status = match error.code {
@@ -80,6 +91,7 @@ pub(crate) async fn handle(
                 _ => 503,
             };
             let message = match error.code {
+                ErrorCode::Conflict if call.request.path.starts_with("test") => &error.message,
                 ErrorCode::Conflict => "规则已被其他页面更新，请重新读取后编辑",
                 ErrorCode::InvalidInput => &error.message,
                 _ => "账号请求头操作失败，请重新读取确认当前规则",
@@ -103,7 +115,7 @@ pub(crate) async fn handle(
     ))
 }
 
-async fn route(call: &TypedCall<ManagementRequest>) -> Result<Value, PluginFault> {
+async fn route(call: &TypedCall<ManagementRequest>, tests: &Tests) -> Result<Value, PluginFault> {
     let mut query = BTreeMap::new();
     for (key, value) in parse(call.request.query.as_bytes()).into_owned() {
         if query.insert(key, value).is_some() {
@@ -132,6 +144,8 @@ async fn route(call: &TypedCall<ManagementRequest>) -> Result<Value, PluginFault
             }
             to_value(store::save(&call.host, input).await?).map_err(|_| invalid())
         }
+        ("POST", "test") if query.is_empty() => tests.run(call).await,
+        ("POST", "test/cancel") if query.is_empty() => tests.cancel(call),
         _ => Err(invalid()),
     }
 }

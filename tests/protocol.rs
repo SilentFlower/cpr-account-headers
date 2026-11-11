@@ -27,6 +27,9 @@ struct Host {
     fail_next: bool,
     cancel_next: bool,
     id: u64,
+    http_status: u16,
+    http_body: Vec<u8>,
+    dispatch_count: usize,
 }
 
 impl Host {
@@ -48,6 +51,9 @@ impl Host {
             fail_next: false,
             cancel_next: false,
             id: 0,
+            http_status: 200,
+            http_body: Vec::new(),
+            dispatch_count: 0,
         };
         let manifest = Manifest::from_author_slice(include_bytes!("../plugin.json")).unwrap();
         host.send(
@@ -172,6 +178,24 @@ impl Host {
                                 "enabled":true,"group_ids":[],"updated_at_ms":0
                             }],"next_cursor":if second {None} else {Some("next-page")}})).unwrap();
                             Ok(json!({}))
+                        }
+                        "host.http.dispatch" => {
+                            self.dispatch_count += 1;
+                            assert_eq!(params["method"], "GET");
+                            let uri = params["uri"].as_str().unwrap();
+                            assert!(uri.starts_with("/api/admin/accounts/connection-test?"));
+                            assert!(uri.contains("outboundPlugins=true"));
+                            assert!(uri.contains(ACCOUNT));
+                            assert!(uri.contains("modelId=test-model"));
+                            assert_eq!(params["headers"], json!([]));
+                            Ok(
+                                json!({"status":self.http_status,"version":"HTTP/1.1","headers":[],"body":{"kind":"handle","handle":"probe-body"},"response":null,"session":false}),
+                            )
+                        }
+                        "host.http.body_read" => {
+                            assert_eq!(params["handle"], "probe-body");
+                            payload = std::mem::take(&mut self.http_body);
+                            Ok(json!({"eof":payload.is_empty(),"trailers":null}))
                         }
                         "host.middleware.next" => {
                             self.next_count += 1;
@@ -333,4 +357,84 @@ async fn failures_and_cancel_keep_session_usable_without_replaying_next() {
     host.cancel_next = false;
     assert!(host.outbound(ACCOUNT, false, b"payload").await.is_ok());
     assert_eq!(host.next_count, 3);
+}
+
+#[tokio::test]
+async fn account_tests_require_matching_evidence_and_keep_upstream_errors() {
+    let mut host = Host::start(State::new()).await;
+    let evidence = json!({"type":"outbound_request","accountId":ACCOUNT,"requestId":"req_probe","transport":"http","headers":[{"name":"user-agent","value":"fixture-agent"}]});
+    for (account, complete, error, expected) in [
+        (ACCOUNT, true, false, "success"),
+        (OTHER, true, false, "unsupported"),
+        (ACCOUNT, false, false, "unsupported"),
+        (ACCOUNT, false, true, "failed"),
+    ] {
+        let mut event = evidence.clone();
+        event["accountId"] = json!(account);
+        let mut stream = format!("data: {event}\r\n\r\n");
+        if complete {
+            stream.push_str("data: {\"type\":\"test_complete\",\"success\":true}\n\n");
+        }
+        if error {
+            stream.push_str("data: {\"type\":\"error\",\"error\":\"fixture failure\",\"sendState\":\"not_sent\"}\n\n");
+        }
+        host.http_body = stream.into_bytes();
+        let (status, result) = host
+            .management(
+                "POST",
+                "test",
+                "",
+                json!({"id":"a".repeat(32),"accountId":ACCOUNT,"modelId":"test-model"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(result["status"], expected);
+        if error {
+            assert_eq!(result["message"], "fixture failure");
+            assert_eq!(result["error"]["sendState"], "not_sent");
+            assert_eq!(
+                result["outbound"][0]["headers"][0]["value"],
+                "fixture-agent"
+            );
+        }
+    }
+    host.http_status = 400;
+    host.http_body = b"unknown field outboundPlugins".to_vec();
+    let (_, result) = host
+        .management(
+            "POST",
+            "test",
+            "",
+            json!({"id":"a".repeat(32),"accountId":ACCOUNT,"modelId":"test-model"}),
+        )
+        .await;
+    assert_eq!(result["status"], "unsupported");
+    let before = host.dispatch_count;
+    assert_eq!(
+        host.management("POST", "test/cancel", "", json!({"id":"b".repeat(32)}))
+            .await
+            .0,
+        200
+    );
+    let (_, result) = host
+        .management(
+            "POST",
+            "test",
+            "",
+            json!({"id":"b".repeat(32),"accountId":ACCOUNT,"modelId":"test-model"}),
+        )
+        .await;
+    assert_eq!(result["status"], "cancelled");
+    assert_eq!(host.dispatch_count, before);
+    assert_eq!(
+        host.management(
+            "POST",
+            "test",
+            "",
+            json!({"id":"invalid","accountId":ACCOUNT,"modelId":"test-model"})
+        )
+        .await
+        .0,
+        400
+    );
 }

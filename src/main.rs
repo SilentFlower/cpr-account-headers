@@ -2,6 +2,7 @@
 
 mod management;
 mod store;
+mod testing;
 
 use std::error::Error;
 
@@ -24,9 +25,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         return Err("插件握手身份不匹配".into());
     }
+    let tests = testing::Tests::default();
     let plugin = PluginBuilder::from_json(include_bytes!("../plugin.json"))?
         .middleware(outbound)?
-        .management(management::registration(), management::handle)?
+        .management(management::registration(), move |call| {
+            management::handle(call, tests.clone())
+        })?
         .build()?;
     session.run(plugin).await?;
     Ok(())

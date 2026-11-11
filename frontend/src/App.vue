@@ -5,6 +5,7 @@ import { ZButton, ZCard, ZConfigProvider, ZEmpty, ZInput, ZTable, ZTag } from '@
 import { zhHans } from '@codex-proxy/ui/locale'
 import { computed, onBeforeUnmount, shallowRef } from 'vue'
 import { listAccounts } from './api/modules/headers'
+import AccountTest from './components/AccountTest.vue'
 import RuleEditor from './components/RuleEditor.vue'
 
 const snapshot = shallowRef<AccountPage>()
@@ -16,6 +17,8 @@ const cursors = shallowRef<(string | null)[]>([null])
 const page = shallowRef(0)
 const selected = shallowRef<Account>()
 const editorOpen = shallowRef(false)
+const testerOpen = shallowRef(false)
+const modalOpen = computed(() => editorOpen.value || testerOpen.value)
 const notice = shallowRef('')
 const rows = computed(() => snapshot.value?.accounts ?? [])
 const columns: TableColumn<Account>[] = [
@@ -48,7 +51,7 @@ const columns: TableColumn<Account>[] = [
     key: 'actions',
     label: '操作',
     kind: 'actions',
-    width: 80,
+    width: 140,
   },
 ]
 let sequence = 0
@@ -100,6 +103,11 @@ function edit(account: Account) {
   editorOpen.value = true
   notice.value = ''
 }
+function test(account: Account) {
+  selected.value = account
+  testerOpen.value = true
+  notice.value = ''
+}
 function saved(value: RuleSnapshot) {
   if (snapshot.value) {
     snapshot.value = {
@@ -115,20 +123,21 @@ function saved(value: RuleSnapshot) {
 
 <template>
   <ZConfigProvider :locale="zhHans">
-    <main class="space-y-4 text-z-text" :class="{ 'overflow-clip': editorOpen }" :style="editorOpen ? { maxHeight: 'var(--plugin-viewport-height, 100dvh)' } : undefined">
+    <main class="space-y-4 text-z-text" :class="{ 'overflow-clip': modalOpen }" :style="modalOpen ? { maxHeight: 'var(--plugin-viewport-height, 100dvh)' } : undefined">
       <RuleEditor v-model="editorOpen" :account="selected" @saved="saved" />
+      <AccountTest v-model="testerOpen" :account="selected" />
       <ZCard>
         <form class="flex flex-wrap items-center gap-3" @submit.prevent="query">
           <ZInput v-model="search" aria-label="搜索账号" placeholder="账号名称、邮箱或 ID" maxlength="256" class="w-full sm:max-w-96" />
-          <ZButton type="primary" native-type="submit" :disabled="loading || editorOpen">
+          <ZButton type="primary" native-type="submit" :disabled="loading || modalOpen">
             查询
           </ZButton>
-          <ZButton :loading="loading" :disabled="editorOpen" class="sm:ml-auto" @click="load(page)">
+          <ZButton :loading="loading" :disabled="modalOpen" class="sm:ml-auto" @click="load(page)">
             刷新
           </ZButton>
         </form>
         <p class="mt-3 text-z-sm text-z-text-secondary">
-          覆写作用于模型请求，账号页“测试连接”使用宿主默认请求头
+          点击“测试”可查看此账号经过出站插件后的 UA 和 originator
         </p>
       </ZCard>
       <ZCard>
@@ -163,8 +172,11 @@ function saved(value: RuleSnapshot) {
             </ZTag>
           </template>
           <template #actions="{ row }">
-            <ZButton variant="link" size="small" :aria-label="`编辑 ${row.name || row.account_id}`" :disabled="loading || editorOpen" @click="edit(row)">
+            <ZButton variant="link" size="small" :aria-label="`编辑 ${row.name || row.account_id}`" :disabled="loading || modalOpen" @click="edit(row)">
               编辑
+            </ZButton>
+            <ZButton variant="link" size="small" :aria-label="`测试 ${row.name || row.account_id}`" :disabled="loading || modalOpen" @click="test(row)">
+              测试
             </ZButton>
           </template>
           <template #empty>
@@ -174,10 +186,10 @@ function saved(value: RuleSnapshot) {
         <div v-if="snapshot" class="mt-4 flex flex-wrap items-center justify-between gap-3 text-z-sm text-z-text-secondary">
           <span>第 {{ page + 1 }} 页，本页 {{ rows.length }} 个账号</span>
           <div class="flex gap-2">
-            <ZButton size="small" :disabled="loading || editorOpen || page === 0" @click="load(page - 1)">
+            <ZButton size="small" :disabled="loading || modalOpen || page === 0" @click="load(page - 1)">
               上一页
             </ZButton>
-            <ZButton size="small" :disabled="loading || editorOpen || !snapshot.next_cursor" @click="next">
+            <ZButton size="small" :disabled="loading || modalOpen || !snapshot.next_cursor" @click="next">
               下一页
             </ZButton>
           </div>
