@@ -1,0 +1,28 @@
+{
+  "manifestVersion": 2,
+  "publisher": "silentflower",
+  "name": "account-headers",
+  "displayName": "账号请求头",
+  "version": "0.1.0",
+  "description": "按账号自定义覆写模型上游请求头",
+  "license": "Apache-2.0",
+  "engines": { "codex-proxy-rs": ">=3.43.0" },
+  "main": "bin/cpr-account-headers",
+  "runtime": "trustedProcess",
+  "resources": {
+    "LICENSE": "text/plain",
+    "NOTICE": "text/plain",
+    "THIRD_PARTY_LICENSES.txt": "text/plain",
+    "web/index.html": "text/html",
+    "web/app.js": "application/javascript",
+    "web/app.css": "text/css"
+  },
+  "contributes": {
+    "middleware": { "version": 6, "stages": ["outbound"], "inputFormats": ["openai"], "outputFormats": ["openai"] },
+    "management": { "version": 2 }
+  },
+  "configurationSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+  "state": [
+    { "namespace": "headers", "schemaVersion": 1, "schema": { "type": "object" }, "maximumRecords": 10000, "maximumBytes": 16777216, "maximumValueBytes": 65536 }
+  ]
+}
