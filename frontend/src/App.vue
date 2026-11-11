@@ -1,200 +1,187 @@
 <script setup lang="ts">
-import type { Account, RuleSnapshot } from './api/modules/headers'
-import { ZButton, ZCard, ZConfigProvider, ZEmpty, ZInput, ZSelect, ZSwitch } from '@codex-proxy/ui'
+import type { TableColumn } from '@codex-proxy/ui'
+import type { Account, AccountPage, RuleSnapshot } from './api/modules/headers'
+import { ZButton, ZCard, ZConfigProvider, ZEmpty, ZInput, ZTable, ZTag } from '@codex-proxy/ui'
 import { zhHans } from '@codex-proxy/ui/locale'
-import { computed, onBeforeUnmount, ref, shallowRef, watch } from 'vue'
-import { getRule, listAccounts, saveRule } from './api/modules/headers'
-import { ResponseError } from './api/request'
+import { computed, onBeforeUnmount, shallowRef } from 'vue'
+import { listAccounts } from './api/modules/headers'
+import RuleEditor from './components/RuleEditor.vue'
 
-const accounts = shallowRef<Account[]>([])
-const selected = shallowRef<string>()
-const saved = shallowRef<RuleSnapshot>()
-const draft = ref<RuleSnapshot>()
-const loadingAccounts = shallowRef(false)
-const loadingRule = shallowRef(false)
-const saving = shallowRef(false)
-const accountError = shallowRef('')
+const snapshot = shallowRef<AccountPage>()
+const loading = shallowRef(false)
 const error = shallowRef('')
+const search = shallowRef('')
+const appliedSearch = shallowRef('')
+const cursors = shallowRef<(string | null)[]>([null])
+const page = shallowRef(0)
+const selected = shallowRef<Account>()
+const editorOpen = shallowRef(false)
 const notice = shallowRef('')
-const mustReload = shallowRef(false)
-const dirty = computed(() => JSON.stringify(draft.value) !== JSON.stringify(saved.value))
-const busy = computed(() => saving.value || loadingRule.value)
-const editorDisabled = computed(() => busy.value || mustReload.value)
-const options = computed(() => accounts.value.map(account => ({
-  value: account.account_id,
-  label: `${account.name || account.email || account.account_id} · ${account.provider_id}${account.enabled ? '' : ' · 已停用'}`,
-  description: [account.email, account.account_id].filter(Boolean).join(' · '),
-})))
-let accountController: AbortController | undefined
-let ruleSequence = 0
-let active = true
-
+const rows = computed(() => snapshot.value?.accounts ?? [])
+const columns: TableColumn<Account>[] = [
+  {
+    key: 'name',
+    label: '账号',
+    kind: 'identity',
+    minWidth: 260,
+  },
+  { key: 'provider_id', label: '平台', minWidth: 90 },
+  {
+    key: 'enabled',
+    label: '账号状态',
+    kind: 'status',
+    minWidth: 100,
+  },
+  {
+    key: 'override_enabled',
+    label: '请求头覆写',
+    kind: 'status',
+    minWidth: 110,
+  },
+  {
+    key: 'header_count',
+    label: '请求头数量',
+    kind: 'numeric',
+    minWidth: 100,
+  },
+  {
+    key: 'actions',
+    label: '操作',
+    kind: 'actions',
+    width: 80,
+  },
+]
+let sequence = 0
+let alive = true
 onBeforeUnmount(() => {
-  active = false
-  accountController?.abort()
-  ruleSequence++
+  alive = false
+  sequence++
 })
-watch(selected, () => void loadRule())
-void loadAccounts()
+void load(0, '', [null])
 
-async function loadAccounts() {
-  accountController?.abort()
-  const controller = new AbortController()
-  accountController = controller
-  loadingAccounts.value = true
-  accountError.value = ''
-  try {
-    const value = await listAccounts(controller.signal)
-    if (!controller.signal.aborted)
-      accounts.value = value
-  }
-  catch (cause) {
-    if (!controller.signal.aborted)
-      accountError.value = message(cause)
-  }
-  finally {
-    if (!controller.signal.aborted)
-      loadingAccounts.value = false
-  }
-}
-
-async function loadRule() {
-  const id = selected.value
-  const sequence = ++ruleSequence
-  draft.value = undefined
-  saved.value = undefined
+async function load(target: number, query = appliedSearch.value, history = cursors.value) {
+  const current = ++sequence
+  loading.value = true
   error.value = ''
-  notice.value = ''
-  mustReload.value = false
-  if (!id)
-    return
-  loadingRule.value = true
   try {
-    const value = await getRule(id)
-    if (active && sequence === ruleSequence) {
-      saved.value = value
-      draft.value = structuredClone(value)
+    const value = await listAccounts(history[target] ?? null, query)
+    if (alive && current === sequence) {
+      snapshot.value = value
+      page.value = target
+      cursors.value = history
+      appliedSearch.value = query
     }
   }
   catch (cause) {
-    if (active && sequence === ruleSequence)
-      error.value = message(cause)
-  }
-  finally {
-    if (active && sequence === ruleSequence)
-      loadingRule.value = false
-  }
-}
-
-async function save() {
-  if (!draft.value || editorDisabled.value || !dirty.value)
-    return
-  saving.value = true
-  error.value = ''
-  notice.value = ''
-  try {
-    const value = await saveRule(structuredClone({
-      ...draft.value,
-      headers: draft.value.headers.map(header => ({ ...header })),
-    }))
-    if (active) {
-      saved.value = value
-      draft.value = structuredClone(value)
-      notice.value = '规则已保存'
-    }
-  }
-  catch (cause) {
-    if (active) {
-      const rejected = cause instanceof ResponseError && [400, 404, 409].includes(cause.status)
-      mustReload.value = !(cause instanceof ResponseError && cause.status === 400)
-      error.value = rejected
-        ? message(cause)
-        : '保存结果待确认，请重新读取当前规则'
+    if (alive && current === sequence) {
+      error.value = cause instanceof Error
+        ? cause.message
+        : '账号列表读取失败'
     }
   }
   finally {
-    if (active)
-      saving.value = false
+    if (alive && current === sequence)
+      loading.value = false
   }
 }
-
-function reset() {
-  if (saved.value)
-    draft.value = structuredClone(saved.value)
-  error.value = ''
+function query() {
+  void load(0, search.value.trim(), [null])
+}
+function next() {
+  if (snapshot.value?.next_cursor) {
+    void load(page.value + 1, appliedSearch.value, [
+      ...cursors.value.slice(0, page.value + 1),
+      snapshot.value.next_cursor,
+    ])
+  }
+}
+function edit(account: Account) {
+  selected.value = account
+  editorOpen.value = true
   notice.value = ''
 }
-
-function message(cause: unknown) {
-  return cause instanceof Error
-    ? cause.message
-    : '请求失败'
+function saved(value: RuleSnapshot) {
+  if (snapshot.value) {
+    snapshot.value = {
+      ...snapshot.value,
+      accounts: snapshot.value.accounts.map(account => account.account_id === value.accountId
+        ? { ...account, override_enabled: value.enabled, header_count: value.headers.length }
+        : account),
+    }
+  }
+  notice.value = '规则已保存'
 }
 </script>
 
 <template>
   <ZConfigProvider :locale="zhHans">
-    <main class="space-y-4 text-z-text">
+    <main class="space-y-4 text-z-text" :class="{ 'overflow-clip': editorOpen }" :style="editorOpen ? { maxHeight: 'var(--plugin-viewport-height, 100dvh)' } : undefined">
+      <RuleEditor v-model="editorOpen" :account="selected" @saved="saved" />
       <ZCard>
-        <div class="flex flex-wrap items-center gap-3">
-          <span id="account-label" class="text-z-sm font-emphasis">账号</span>
-          <ZSelect v-model="selected" aria-labelledby="account-label" :options="options" filterable placeholder="搜索并选择账号" :loading="loadingAccounts" :disabled="busy || dirty" class="min-w-0 flex-1 sm:max-w-xl" />
-          <ZButton :loading="loadingAccounts" :disabled="busy" @click="loadAccounts">
-            刷新账号
+        <form class="flex flex-wrap items-center gap-3" @submit.prevent="query">
+          <ZInput v-model="search" aria-label="搜索账号" placeholder="账号名称、邮箱或 ID" maxlength="256" class="w-full sm:max-w-96" />
+          <ZButton type="primary" native-type="submit" :disabled="loading || editorOpen">
+            查询
           </ZButton>
-        </div>
-        <p v-if="accountError" role="alert" class="mt-3 text-z-sm text-z-error">
-          {{ accountError }}
-        </p>
-        <p v-if="dirty" role="status" class="mt-3 text-z-sm text-z-text-secondary">
-          当前账号有未保存的修改，保存或撤销后可切换账号
+          <ZButton :loading="loading" :disabled="editorOpen" class="sm:ml-auto" @click="load(page)">
+            刷新
+          </ZButton>
+        </form>
+        <p class="mt-3 text-z-sm text-z-text-secondary">
+          覆写作用于模型请求，账号页“测试连接”使用宿主默认请求头
         </p>
       </ZCard>
       <ZCard>
         <div v-if="error" role="alert" class="mb-4 flex flex-wrap items-center gap-3 rounded-z bg-z-error-container p-3 text-z-error-on-container">
           <span>{{ error }}</span>
-          <ZButton v-if="selected && (!draft || mustReload)" size="small" :disabled="busy" @click="loadRule">
+          <ZButton size="small" :disabled="loading" @click="load(page)">
             重新读取
           </ZButton>
         </div>
         <p v-if="notice" role="status" class="mb-4 text-z-sm text-z-success">
           {{ notice }}
         </p>
-        <p v-if="loadingRule" role="status" class="text-z-sm text-z-text-secondary">
-          正在读取请求头规则
-        </p>
-        <form v-else-if="draft" class="space-y-4" @submit.prevent="save">
-          <div class="flex flex-wrap items-center justify-between gap-3">
-            <ZSwitch v-model="draft.enabled" label="启用覆写" :disabled="editorDisabled" />
-            <span class="text-z-sm text-z-text-secondary">{{ draft.headers.length }} / 64 个请求头</span>
-          </div>
-          <p class="text-z-sm text-z-text-secondary">
-            同名请求头会被替换，名称不区分大小写，其他请求头保持原样
-          </p>
-          <p class="text-z-sm text-z-text-secondary">
-            WebSocket 已建立的连接沿用原握手头，新建连接时使用当前规则
-          </p>
-          <div v-for="(header, index) in draft.headers" :key="index" class="grid grid-cols-1 items-start gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,2fr)_auto]">
-            <ZInput v-model="header.name" :aria-label="`请求头名称 ${index + 1}`" placeholder="请求头名称，如 User-Agent" :disabled="editorDisabled" autocomplete="off" spellcheck="false" />
-            <ZInput v-model="header.value" :aria-label="`请求头值 ${index + 1}`" placeholder="请求头值，可留空" type="password" show-password :disabled="editorDisabled" autocomplete="off" spellcheck="false" />
-            <ZButton :aria-label="`移除请求头 ${index + 1}`" :disabled="editorDisabled" @click="draft.headers.splice(index, 1)">
-              移除
+        <ZTable :columns="columns" :data="rows" row-key="account_id" :loading="loading" size="small">
+          <template #name="{ row }">
+            <div class="space-y-1">
+              <div class="truncate font-emphasis" :title="row.name || row.account_id">
+                {{ row.name || row.account_id }}
+              </div>
+              <div class="truncate text-z-xs text-z-text-secondary" :title="row.email || row.account_id">
+                {{ row.email || row.account_id }}
+              </div>
+            </div>
+          </template>
+          <template #enabled="{ row }">
+            <ZTag :type="row.enabled ? 'success' : 'info'" size="small">
+              {{ row.enabled ? '已启用' : '已停用' }}
+            </ZTag>
+          </template>
+          <template #override_enabled="{ row }">
+            <ZTag :type="row.override_enabled ? 'success' : 'info'" size="small">
+              {{ row.override_enabled ? '已开启' : '已关闭' }}
+            </ZTag>
+          </template>
+          <template #actions="{ row }">
+            <ZButton variant="link" size="small" :aria-label="`编辑 ${row.name || row.account_id}`" :disabled="loading || editorOpen" @click="edit(row)">
+              编辑
+            </ZButton>
+          </template>
+          <template #empty>
+            <ZEmpty :title="error ? '账号读取失败' : '暂无匹配账号'" surface="none" />
+          </template>
+        </ZTable>
+        <div v-if="snapshot" class="mt-4 flex flex-wrap items-center justify-between gap-3 text-z-sm text-z-text-secondary">
+          <span>第 {{ page + 1 }} 页，本页 {{ rows.length }} 个账号</span>
+          <div class="flex gap-2">
+            <ZButton size="small" :disabled="loading || editorOpen || page === 0" @click="load(page - 1)">
+              上一页
+            </ZButton>
+            <ZButton size="small" :disabled="loading || editorOpen || !snapshot.next_cursor" @click="next">
+              下一页
             </ZButton>
           </div>
-          <ZEmpty v-if="!draft.headers.length" title="尚未配置请求头" description="添加需要覆写的名称和值" surface="none" />
-          <div class="flex flex-wrap items-center gap-3">
-            <ZButton :disabled="editorDisabled || draft.headers.length >= 64" @click="draft.headers.push({ name: '', value: '' })">
-              添加请求头
-            </ZButton>
-            <ZButton :disabled="editorDisabled || !dirty" @click="reset">
-              撤销修改
-            </ZButton>
-            <ZButton type="primary" native-type="submit" :loading="saving" :disabled="editorDisabled || !dirty" class="sm:ml-auto">
-              保存
-            </ZButton>
-          </div>
-        </form>
-        <ZEmpty v-else-if="!selected" :title="loadingAccounts ? '正在读取账号' : accounts.length ? '请选择账号' : '暂无账号'" description="每个账号单独保存请求头规则" surface="none" />
+        </div>
       </ZCard>
     </main>
   </ZConfigProvider>

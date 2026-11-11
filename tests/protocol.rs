@@ -248,7 +248,10 @@ async fn management_and_account_rules_survive_process_restart() {
     assert_eq!(registration["pages"][0]["id"], "headers");
     let (status, page) = host.management("GET", "accounts", "", Value::Null).await;
     assert_eq!(status, 200);
-    assert_eq!(page["next_cursor"], "next-page");
+    assert!(page["next_cursor"].is_null());
+    assert_eq!(page["accounts"].as_array().unwrap().len(), 2);
+    assert_eq!(page["accounts"][0]["override_enabled"], false);
+    assert_eq!(page["accounts"][0]["header_count"], 0);
     let (_, page) = host
         .management("GET", "accounts", "cursor=next-page", Value::Null)
         .await;
@@ -266,6 +269,14 @@ async fn management_and_account_rules_survive_process_restart() {
     assert_eq!(status, 200);
     assert_eq!(saved["version"], "1");
     assert_eq!(saved["headers"][0]["name"], "user-agent");
+    let (status, page) = host
+        .management("GET", "accounts", &format!("search={ACCOUNT}"), Value::Null)
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(page["accounts"].as_array().unwrap().len(), 1);
+    assert_eq!(page["accounts"][0]["override_enabled"], true);
+    assert_eq!(page["accounts"][0]["header_count"], 2);
+    assert!(page["accounts"][0].get("headers").is_none());
     let (status, _) = host.management("POST", "rule", "", snapshot).await;
     assert_eq!(status, 409);
     let mut invalid = saved.clone();

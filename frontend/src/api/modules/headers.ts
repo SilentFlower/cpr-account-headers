@@ -7,7 +7,12 @@ export interface Account {
   name: string
   email: string | null
   enabled: boolean
+  override_enabled: boolean
+  header_count: number
 }
+
+/** 使用稳定账号游标的列表页 */
+export interface AccountPage { accounts: Account[], next_cursor: string | null }
 
 /** 按名称覆写的头值，空字符串表示发送空值 */
 export interface HeaderOverride { name: string, value: string }
@@ -21,27 +26,21 @@ export interface RuleSnapshot {
 }
 
 /**
- * 遍历宿主账号分页，页面销毁或刷新后停止读取后续页
- * @param signal 当前加载操作的取消信号
- * @return 全部账号事实
+ * 查询一页账号及当前覆写状态，搜索覆盖全部账号
+ * @param cursor 上一页返回的稳定账号游标
+ * @param search 账号名称、邮箱或 ID
+ * @return 当前页与下一页游标
  */
-export async function listAccounts(signal: AbortSignal): Promise<Account[]> {
-  const accounts: Account[] = []
-  let cursor: string | null = null
-  do {
-    signal.throwIfAborted()
-    const value = await request('accounts', new URLSearchParams(cursor
-      ? { cursor }
-      : {}))
-    signal.throwIfAborted()
-    if (!isObject(value) || !Array.isArray(value.accounts) || !value.accounts.every(isAccount)
-      || (value.next_cursor !== null && typeof value.next_cursor !== 'string')) {
-      throw new Error('账号列表响应无效')
-    }
-    accounts.push(...value.accounts)
-    cursor = value.next_cursor as string | null
-  } while (cursor !== null)
-  return accounts
+export async function listAccounts(cursor: string | null, search: string): Promise<AccountPage> {
+  const query = new URLSearchParams({ search })
+  if (cursor)
+    query.set('cursor', cursor)
+  const value = await request('accounts', query)
+  if (!isObject(value) || !Array.isArray(value.accounts) || !value.accounts.every(isAccount)
+    || (value.next_cursor !== null && typeof value.next_cursor !== 'string')) {
+    throw new Error('账号列表响应无效')
+  }
+  return value as unknown as AccountPage
 }
 
 /**
@@ -65,6 +64,7 @@ export async function saveRule(input: RuleSnapshot): Promise<RuleSnapshot> {
 function isAccount(value: unknown): value is Account {
   return isObject(value) && ['account_id', 'provider_id', 'name'].every(key => typeof value[key] === 'string')
     && (value.email === null || typeof value.email === 'string') && typeof value.enabled === 'boolean'
+    && typeof value.override_enabled === 'boolean' && Number.isSafeInteger(value.header_count) && Number(value.header_count) >= 0
 }
 
 function snapshot(value: unknown, accountId: string): RuleSnapshot {

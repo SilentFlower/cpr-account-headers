@@ -6,7 +6,7 @@ use form_urlencoded::parse;
 use gateway_plugin_sdk::{
     ErrorCode, PluginFault,
     call::{
-        data::AccountFactsQuery,
+        data::{AccountFacts, AccountFactsQuery},
         management::{
             ManagementPage, ManagementRegistration, ManagementRequest, ManagementResource,
             ManagementResponse, ManagementRoute,
@@ -15,9 +15,19 @@ use gateway_plugin_sdk::{
     },
     client::{TypedCall, TypedReply},
 };
+use serde::Serialize;
 use serde_json::{Value, from_slice, json, to_value, to_vec};
 
 use crate::store::{self, Snapshot};
+
+/// 列表只公开规则状态与数量，头值由编辑接口按账号读取
+#[derive(Serialize)]
+struct AccountEntry {
+    #[serde(flatten)]
+    account: AccountFacts,
+    override_enabled: bool,
+    header_count: usize,
+}
 
 /// 注册页面及其最小管理接口，资源由宿主按包摘要交付
 /// @return 与作者清单一致的管理注册
@@ -46,7 +56,7 @@ pub(crate) fn registration() -> ManagementRegistration {
         pages: vec![ManagementPage {
             id: "headers".into(),
             title: "账号请求头".into(),
-            description: Some("选择账号，覆写发往模型上游的请求头".into()),
+            description: Some("查看各账号的请求头覆写状态，编辑上游请求头".into()),
             entry: "web/index.html".into(),
             icon: None,
         }],
@@ -101,16 +111,13 @@ async fn route(call: &TypedCall<ManagementRequest>) -> Result<Value, PluginFault
         }
     }
     match (call.request.method.as_str(), call.request.path.as_str()) {
-        ("GET", "accounts") if query.keys().all(|key| key == "cursor") => {
-            let page = call
-                .host
-                .account_facts(AccountFactsQuery {
-                    provider_id: None,
-                    cursor: query.remove("cursor"),
-                    limit: 200,
-                })
-                .await?;
-            to_value(page).map_err(|_| invalid())
+        ("GET", "accounts") if query.keys().all(|key| key == "cursor" || key == "search") => {
+            accounts(
+                call,
+                query.remove("cursor"),
+                query.remove("search").unwrap_or_default(),
+            )
+            .await
         }
         ("GET", "rule")
             if query.len() == 1 && query.get("accountId").is_some_and(|id| !id.is_empty()) =>
@@ -126,6 +133,56 @@ async fn route(call: &TypedCall<ManagementRequest>) -> Result<Value, PluginFault
             to_value(store::save(&call.host, input).await?).map_err(|_| invalid())
         }
         _ => Err(invalid()),
+    }
+}
+
+async fn accounts(
+    call: &TypedCall<ManagementRequest>,
+    mut cursor: Option<String>,
+    search: String,
+) -> Result<Value, PluginFault> {
+    if search.len() > 256 {
+        return Err(invalid());
+    }
+    let search = search.trim().to_lowercase();
+    let mut entries: Vec<AccountEntry> = Vec::new();
+    loop {
+        let page = call
+            .host
+            .account_facts(AccountFactsQuery {
+                provider_id: None,
+                cursor,
+                limit: 200,
+            })
+            .await?;
+        for account in page.accounts {
+            if !search.is_empty()
+                && ![
+                    account.name.as_str(),
+                    account.email.as_deref().unwrap_or(""),
+                    &account.account_id,
+                ]
+                .iter()
+                .any(|text| text.to_lowercase().contains(&search))
+            {
+                continue;
+            }
+            // 多读一个匹配账号确认下一页，只为当前展示的账号读取规则
+            if entries.len() == 20 {
+                let next_cursor = &entries[19].account.account_id;
+                return Ok(json!({"accounts":entries,"next_cursor":next_cursor}));
+            }
+            let snapshot = store::load(&call.host, account.account_id.clone()).await?;
+            entries.push(AccountEntry {
+                account,
+                override_enabled: snapshot.rule.enabled,
+                header_count: snapshot.rule.headers.len(),
+            });
+        }
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            return Ok(json!({"accounts":entries,"next_cursor":null}));
+        }
     }
 }
 
