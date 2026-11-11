@@ -189,11 +189,11 @@ function saved(value: RuleSnapshot) {
                 {{ (row.name || row.email || row.account_id).slice(0, 1).toUpperCase() }}
               </span>
               <div class="min-w-0 space-y-1">
-                <div class="truncate font-emphasis" :title="row.name || row.account_id">
-                  {{ row.name || row.account_id }}
+                <div class="truncate font-emphasis" :title="row.account_id">
+                  {{ row.name || row.email || row.account_id }}
                 </div>
-                <div class="truncate text-z-xs text-z-text-secondary" :title="row.email || row.account_id">
-                  {{ row.email || row.account_id }}
+                <div v-if="row.name && row.email && row.email !== row.name" class="truncate text-z-xs text-z-text-secondary" :title="row.email">
+                  {{ row.email }}
                 </div>
               </div>
             </div>

@@ -97,7 +97,7 @@ async function save() {
 </script>
 
 <template>
-  <ZDialog v-model="open" title="编辑请求头" :description="account?.name || account?.email || account?.account_id" width="52rem" :show-close="!saving" :close-on-click-modal="false" :close-on-press-escape="!saving">
+  <ZDialog v-model="open" title="编辑请求头" :description="[account?.name || account?.account_id, account?.email && account.email !== account.name ? account.email : null].filter(Boolean).join(' · ')" width="52rem" :show-close="!saving" :close-on-click-modal="false" :close-on-press-escape="!saving">
     <form id="account-headers-editor" class="space-y-4" @submit.prevent="save">
       <p v-if="loading" role="status" class="text-z-sm text-z-text-secondary">
         正在读取请求头规则

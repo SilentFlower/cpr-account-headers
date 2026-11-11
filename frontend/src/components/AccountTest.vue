@@ -94,7 +94,7 @@ function stop() {
 </script>
 
 <template>
-  <ZDialog v-model="open" title="测试请求头" :description="account?.name || account?.email || account?.account_id" width="52rem" :close-on-click-modal="false">
+  <ZDialog v-model="open" title="测试请求头" :description="[account?.name || account?.account_id, account?.email && account.email !== account.name ? account.email : null].filter(Boolean).join(' · ')" width="52rem" :close-on-click-modal="false">
     <form id="account-headers-test" class="space-y-4" @submit.prevent="run">
       <p class="text-z-sm text-z-text-secondary">
         自动准备本账号的专用测试分组和 Key，通过普通模型链路测试，最长等待 45 秒
