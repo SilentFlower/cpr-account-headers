@@ -32,7 +32,8 @@ struct Host {
     cancel_next: bool,
     id: u64,
     resource_calls: usize,
-    extra_member: bool,
+    key_created: usize,
+    key_group: String,
     changed_key_scope: bool,
     http_bodies: HashMap<String, VecDeque<Vec<u8>>>,
     fail_groups: bool,
@@ -58,7 +59,8 @@ impl Host {
             cancel_next: false,
             id: 0,
             resource_calls: 0,
-            extra_member: false,
+            key_created: 0,
+            key_group: "grp_11111111111111111111111111111111".into(),
             changed_key_scope: false,
             http_bodies: HashMap::new(),
             fail_groups: false,
@@ -124,7 +126,11 @@ impl Host {
                     generation: 1,
                     incarnation: "test".into(),
                     stage,
-                    timeout_ms: 5000,
+                    timeout_ms: if matches!(stage, Stage::Routing | Stage::Scheduling) {
+                        2000
+                    } else {
+                        5000
+                    },
                     resource_stream: false,
                     resource_scope_id: format!("test-{call_id}"),
                     request_id: None,
@@ -162,12 +168,24 @@ impl Host {
                             Err(PluginFault::new(ErrorCode::Fault, "测试存储故障"))
                         }
                         "host.state.get" => {
-                            assert_eq!(params["namespace"], "headers");
-                            let record = self.state.get(params["key"].as_str().unwrap()).map(|(value, version)| json!({"value":value,"version":version,"schema_version":1}));
+                            assert!(matches!(
+                                params["namespace"].as_str(),
+                                Some("headers" | "testing")
+                            ));
+                            let state_key = if params["namespace"] == "testing" {
+                                format!("testing:{}", params["key"].as_str().unwrap())
+                            } else {
+                                params["key"].as_str().unwrap().into()
+                            };
+                            let record = self.state.get(&state_key).map(|(value, version)| json!({"value":value,"version":version,"schema_version":1}));
                             Ok(json!({"record":record}))
                         }
                         "host.state.put" => {
-                            let key = params["key"].as_str().unwrap().to_owned();
+                            let key = if params["namespace"] == "testing" {
+                                format!("testing:{}", params["key"].as_str().unwrap())
+                            } else {
+                                params["key"].as_str().unwrap().into()
+                            };
                             let current = self.state.get(&key).map(|(_, version)| *version);
                             if params["expected_version"] != json!(current) {
                                 Err(PluginFault::new(ErrorCode::Conflict, "测试并发冲突"))
@@ -183,17 +201,28 @@ impl Host {
                             let second = query["cursor"] == "next-page";
                             payload = serde_json::to_vec(&json!({"schema_version":1,"accounts":[{
                                 "account_id":if second {OTHER} else {ACCOUNT},"provider_id":"openai","name":"测试账号","email":null,
-                                "enabled":true,"group_ids":if second && self.extra_member {vec!["grp_11111111111111111111111111111111"]} else if !second {vec!["group-main","group-missing"]} else {vec![]},"updated_at_ms":0
+                                "enabled":true,"group_ids":if !second {vec!["group-main","group-missing"]} else {vec![]},"updated_at_ms":0
                             }],"next_cursor":if second {None} else {Some("next-page")}})).unwrap();
                             Ok(json!({}))
                         }
                         "host.http.dispatch" => {
-                            assert_eq!(params["method"], "GET");
                             let uri = params["uri"].as_str().unwrap();
-                            assert!(uri.starts_with("/api/admin/account-groups/options?"));
                             let second = uri.contains("page=2&");
                             let status = if self.fail_groups { 503 } else { 200 };
-                            let data = json!({"items":if second {json!([{"id":"group-main","name":"当前 VIP"}])} else {json!([{"id":"unrelated","name":"其他组"}])},"page":{"page":if second {2} else {1},"pageSize":100,"total":101,"totalPages":2}});
+                            let data = if uri.starts_with("/api/admin/account-groups/options?") {
+                                json!({"items":if second {json!([{"id":"group-main","name":"当前 VIP","enabled":true}])} else {json!([{"id":"unrelated","name":"其他组","enabled":true}])},"page":{"page":if second {2} else {1},"pageSize":100,"total":101,"totalPages":2}})
+                            } else if uri.starts_with("/api/admin/client-keys?") {
+                                json!({"items":if self.key_created > 0 {json!([{"id":"key","name":format!("请求头测试 headers-test {}",self.key_group),"label":"cpr-account-headers:headers-test"}])} else {json!([])},"nextCursor":null})
+                            } else if uri == "/api/admin/client-keys/create" {
+                                assert_eq!(params["method"], "POST");
+                                let body: Value = serde_json::from_slice(&frame.payload).unwrap();
+                                self.key_group = body["groupIds"][0].as_str().unwrap().into();
+                                assert_eq!(body["maxConcurrency"], 4);
+                                self.key_created += 1;
+                                json!({"id":"key","plaintextKey":"never-expose-this"})
+                            } else {
+                                panic!("未预期的管理接口 {uri}")
+                            };
                             let bytes =
                                 serde_json::to_vec(&json!({"code":status,"data":data})).unwrap();
                             let handle = format!("groups-{id}");
@@ -214,6 +243,12 @@ impl Host {
                             Ok(json!({"eof":eof,"trailers":null}))
                         }
                         "host.http.body_close" => Ok(json!({})),
+                        "host.data.access.check" => {
+                            let query: Value = serde_json::from_slice(&frame.payload).unwrap();
+                            let account = query["account_ids"][0].as_str().unwrap();
+                            payload = serde_json::to_vec(&json!({"schema_version":1,"client_key_id":"key","accounts":[{"account_id":account,"allowed":self.key_group != "group-main" || account == ACCOUNT}]})).unwrap();
+                            Ok(json!({}))
+                        }
                         "host.groups.ensure"
                         | "host.groups.change_members"
                         | "host.keys.ensure"
@@ -223,25 +258,17 @@ impl Host {
                             self.resource_calls += 1;
                             let value = match method.as_str() {
                                 "host.groups.ensure" => {
-                                    assert_eq!(query["resource_key"], format!("test.{ACCOUNT}"));
+                                    assert_eq!(query["resource_key"], "test.shared");
                                     json!({"id":"grp_11111111111111111111111111111111","name":"测试分组","enabled":true})
                                 }
                                 "host.groups.change_members" => {
-                                    assert_eq!(query["add"], json!([ACCOUNT]));
+                                    assert_eq!(query["add"], json!([ACCOUNT, OTHER]));
                                     assert_eq!(query["remove"], json!([]));
                                     json!({"added":1,"removed":0})
                                 }
-                                "host.keys.ensure" => {
-                                    assert_eq!(
-                                        query["group_resource_keys"],
-                                        json!([format!("test.{ACCOUNT}")])
-                                    );
-                                    assert_eq!(query["max_concurrency"], 1);
-                                    json!({"id":"key","name":"测试 Key","enabled":true})
-                                }
                                 "host.data.keys.get" => {
                                     assert_eq!(query["client_key_id"], "key");
-                                    json!({"schema_version":1,"client_key_id":"key","enabled":true,"group_ids":[if self.changed_key_scope {"grp_22222222222222222222222222222222"} else {"grp_11111111111111111111111111111111"}]})
+                                    json!({"schema_version":1,"client_key_id":"key","enabled":true,"group_ids":[if self.changed_key_scope {"grp_22222222222222222222222222222222"} else {self.key_group.as_str()}]})
                                 }
                                 _ => unreachable!(),
                             };
@@ -291,6 +318,17 @@ impl Host {
             head["status"].as_u64().unwrap(),
             serde_json::from_slice(&payload).unwrap(),
         )
+    }
+
+    async fn route_test(&mut self, id: &str, request_id: &str) -> Value {
+        self.call(Stage::Routing, "policy.route_model", json!({"request_id":request_id,"operation":"responses","protocol":"openai","model":"test-model","available_providers":["openai","xai"],"headers":[]}), serde_json::to_vec(&json!({"model":"test-model","metadata":{"cpr_account_headers_test":id}})).unwrap()).await.unwrap().0
+    }
+
+    async fn schedule(&mut self, request_id: &str, target_available: bool) -> Value {
+        self.call(Stage::Scheduling, "policy.schedule_account", json!({"request_id":request_id,"attempt_index":1,"provider":"openai","model":"test-model","candidates":[
+            {"account_id":ACCOUNT,"available":target_available,"weight":1,"in_flight":0,"maximum_concurrency":1},
+            {"account_id":OTHER,"available":true,"weight":1,"in_flight":0,"maximum_concurrency":1}
+        ]}), Vec::new()).await.unwrap().0
     }
 
     async fn outbound(
@@ -422,14 +460,15 @@ async fn failures_and_cancel_keep_session_usable_without_replaying_next() {
 }
 
 #[tokio::test]
-async fn account_tests_use_owned_single_account_scope_and_real_outbound_records() {
+async fn account_tests_share_resources_and_pin_real_outbound_records() {
     let mut host = Host::start(State::from([(ACCOUNT.into(), (json!({"enabled":true,"headers":[{"name":"user-agent","value":"fixture-agent"},{"name":"originator","value":"pi"}]}),1))])).await;
     let id = "a".repeat(32);
     let input = json!({"id":id,"accountId":ACCOUNT,"modelId":"test-model"});
     let (status, plan) = host.management("POST", "test", "", input.clone()).await;
     assert_eq!(status, 200);
     assert_eq!(plan["clientKeyId"], "key");
-    assert_eq!(host.resource_calls, 4);
+    assert_eq!(host.resource_calls, 3);
+    assert_eq!(host.route_test(&id, "request").await["decision"], "route");
     assert_eq!(
         host.management(
             "POST",
@@ -458,6 +497,29 @@ async fn account_tests_use_owned_single_account_scope_and_real_outbound_records(
             json!(b"fixture-agent".to_vec())
         );
     }
+    let other_id = "b".repeat(32);
+    assert_eq!(
+        host.management(
+            "POST",
+            "test",
+            "",
+            json!({"id":other_id,"accountId":OTHER,"modelId":"test-model"})
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        host.route_test(&other_id, "other-request").await["decision"],
+        "route"
+    );
+    assert_eq!(
+        host.schedule("other-request", true).await,
+        json!({"decision":"pick","account_id":OTHER})
+    );
+    assert_eq!(host.key_created, 1, "不同账号的同时测试复用同一 Key");
+    host.management("POST", "test/finish", "", json!({"id":other_id}))
+        .await;
     let query = format!("id={id}&requestId=request");
     let (status, captured) = host.management("GET", "test", &query, Value::Null).await;
     assert_eq!(status, 200);
@@ -493,6 +555,7 @@ async fn account_tests_use_owned_single_account_scope_and_real_outbound_records(
         400
     );
     assert_eq!(host.management("POST", "test", "", input).await.0, 200);
+    assert_eq!(host.key_created, 1);
 }
 
 #[tokio::test]
@@ -500,17 +563,6 @@ async fn account_tests_reject_changed_resource_scope_and_handle_early_cancel() {
     let mut host = Host::start(State::new()).await;
     let id = "a".repeat(32);
     let input = json!({"id":id,"accountId":ACCOUNT,"modelId":"test-model"});
-    host.extra_member = true;
-    let (status, error) = host.management("POST", "test", "", input.clone()).await;
-    assert_eq!(status, 400);
-    assert!(
-        error["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("其他账号")
-    );
-    assert_eq!(host.resource_calls, 1);
-    host.extra_member = false;
     host.changed_key_scope = true;
     let (status, error) = host.management("POST", "test", "", input.clone()).await;
     assert_eq!(status, 400);
@@ -540,5 +592,110 @@ async fn account_tests_reject_changed_resource_scope_and_handle_early_cancel() {
         .await
         .0,
         200
+    );
+}
+
+#[tokio::test]
+async fn shared_group_settings_and_scheduling_keep_tests_isolated() {
+    let mut host = Host::start(State::new()).await;
+    let (_, initial) = host
+        .management("GET", "test/settings", "", Value::Null)
+        .await;
+    assert!(initial["settings"]["groupId"].is_null());
+    let (status, saved) = host
+        .management(
+            "POST",
+            "test/settings",
+            "",
+            json!({"groupId":"group-main","version":null}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(saved["version"], "1");
+    assert_eq!(
+        host.management(
+            "POST",
+            "test/settings",
+            "",
+            json!({"groupId":null,"version":null})
+        )
+        .await
+        .0,
+        409
+    );
+    let state = host.state.clone();
+    let mut host = Host::start(state).await;
+    let id = "c".repeat(32);
+    let input = json!({"id":id,"accountId":ACCOUNT,"modelId":"test-model"});
+    assert_eq!(host.management("POST", "test", "", input).await.0, 200);
+    assert_eq!(host.resource_calls, 1, "已有分组只读取 Key 事实");
+    assert_eq!(host.key_group, "group-main");
+    assert_eq!(
+        host.management(
+            "POST",
+            "test",
+            "",
+            json!({"id":"d".repeat(32),"accountId":OTHER,"modelId":"test-model"})
+        )
+        .await
+        .0,
+        400
+    );
+    assert_eq!(
+        host.route_test(&id, "request").await,
+        json!({"decision":"route","provider":"openai"})
+    );
+    assert_eq!(
+        host.schedule("ordinary", true).await,
+        json!({"decision":"delegate"})
+    );
+    assert_eq!(
+        host.schedule("request", true).await,
+        json!({"decision":"pick","account_id":ACCOUNT})
+    );
+    assert_eq!(
+        host.schedule("request", false).await,
+        json!({"decision":"delegate_filtered","exclude_account_ids":[OTHER]})
+    );
+    assert_eq!(
+        host.route_test(&id, "another-request").await["decision"],
+        "reject"
+    );
+    assert_eq!(
+        host.management(
+            "POST",
+            "test/settings",
+            "",
+            json!({"groupId":null,"version":"1"})
+        )
+        .await
+        .0,
+        409
+    );
+    host.management("POST", "test/cancel", "", json!({"id":id}))
+        .await;
+    assert_eq!(host.schedule("request", true).await["decision"], "reject");
+    assert_eq!(
+        host.outbound(ACCOUNT, false, b"cancelled")
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Rejected
+    );
+    assert_eq!(
+        host.management(
+            "POST",
+            "test/settings",
+            "",
+            json!({"groupId":null,"version":"1"})
+        )
+        .await
+        .0,
+        200
+    );
+    let mut restarted = Host::start(host.state.clone()).await;
+    assert_eq!(
+        restarted.route_test(&id, "request").await["decision"],
+        "reject"
     );
 }

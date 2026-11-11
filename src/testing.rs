@@ -1,4 +1,4 @@
-//! 为普通模型链路准备单账号测试身份，并按真实模型请求 ID 收集本插件的覆写记录
+//! 为普通模型链路准备共享测试身份，并按真实模型请求 ID 收集本插件的覆写记录
 
 use std::{
     collections::HashMap,
@@ -10,13 +10,15 @@ use cpr_account_headers::{HeaderOverride, Rule};
 use gateway_plugin_sdk::{
     ErrorCode, PluginFault,
     call::{
-        data::{AccountFactsQuery, ClientKeyFactsQuery},
+        data::AccountFactsQuery,
         management::ManagementRequest,
         middleware::{
             MiddlewareHeader,
             outbound::{Metadata, Target},
         },
-        resources::{GroupEnsureRequest, GroupMembersChange, KeyEnsureRequest},
+        policy::{
+            AccountScheduleDecision, AccountScheduleRequest, ModelRouteDecision, ModelRouteRequest,
+        },
     },
     client::TypedCall,
 };
@@ -25,14 +27,20 @@ use serde_json::{Value, json};
 
 const LIFETIME: Duration = Duration::from_secs(90);
 
-/// 仅保存短期测试关联，分组和 Key 由宿主按插件实例持有
+/// 仅保存短期测试关联，随机标记将共享测试 Key 的请求定向到所选账号
 #[derive(Default, Clone)]
-pub(crate) struct Tests(Arc<Mutex<HashMap<String, Entry>>>);
+pub(crate) struct Tests(
+    Arc<Mutex<HashMap<String, Entry>>>,
+    Arc<tokio::sync::Mutex<()>>,
+);
 
 struct Entry {
     created: Instant,
     account: String,
     key: Option<String>,
+    provider: String,
+    model: String,
+    request_id: Option<String>,
     cancelled: bool,
     records: Vec<Evidence>,
 }
@@ -83,7 +91,7 @@ struct End {
 }
 
 impl Tests {
-    /// 为账号幂等准备专用分组与 Key，页面随后使用普通模型桥发起请求
+    /// 幂等准备统一测试分组与专用 Key，页面随后使用普通模型桥发起请求
     /// @param call 当前管理员调用
     /// @return 不含密钥明文的执行身份与测试关联
     pub(crate) async fn prepare(
@@ -129,6 +137,9 @@ impl Tests {
                     created: Instant::now(),
                     account: input.account_id.clone(),
                     key: None,
+                    provider: String::new(),
+                    model: input.model_id.clone(),
+                    request_id: None,
                     cancelled: false,
                     records: Vec::new(),
                 },
@@ -139,8 +150,11 @@ impl Tests {
             id: input.id.clone(),
             ready: false,
         };
-        let prepare = resources(call, &input.account_id);
-        let key = tokio::select! {
+        let prepare = async {
+            let _guard = self.1.lock().await;
+            resources(call, &input.account_id).await
+        };
+        let (key, provider) = tokio::select! {
             biased;
             _ = call.cancellation.cancelled() => return Err(PluginFault::new(ErrorCode::Cancelled, "测试已停止")),
             _ = tokio::time::sleep(Duration::from_secs(45)) => return Err(PluginFault::new(ErrorCode::Timeout, "测试资源准备超时")),
@@ -153,6 +167,7 @@ impl Tests {
                 .filter(|entry| !entry.cancelled)
                 .ok_or_else(|| PluginFault::new(ErrorCode::Cancelled, "测试已停止"))?;
             entry.key = Some(key.clone());
+            entry.provider = provider;
         }
         reservation.ready = true;
         Ok(json!({"id":input.id,"accountId":input.account_id,"clientKeyId":key}))
@@ -204,6 +219,9 @@ impl Tests {
                         created: Instant::now(),
                         account: String::new(),
                         key: None,
+                        provider: String::new(),
+                        model: String::new(),
+                        request_id: None,
                         cancelled: true,
                         records: Vec::new(),
                     },
@@ -217,24 +235,139 @@ impl Tests {
 
     /// 专用测试 Key 的实际账号必须与页面选择一致，校验先于 next 和网络发送
     /// @param metadata 宿主冻结的账号与 Key 归属
+    /// @param body 上游准备正文中的测试标记
     /// @return 本次准备关联的测试编号
-    pub(crate) fn target(&self, metadata: &Metadata) -> Result<Option<String>, PluginFault> {
+    pub(crate) fn target(
+        &self,
+        metadata: &Metadata,
+        body: &[u8],
+    ) -> Result<Option<String>, PluginFault> {
+        let marked = marker(body).is_some();
         let entries = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        let entry = entries.iter().find(|(_, entry)| {
-            !entry.cancelled
-                && entry.created.elapsed() < LIFETIME
-                && entry.key.as_deref() == Some(&metadata.client_key_id)
-        });
-        let Some((id, entry)) = entry else {
+        // 专用 Key 上的请求必须先由测试路由关联，避免绑定遗漏时随机落到共享组其他账号
+        if !marked
+            && !entries
+                .values()
+                .any(|entry| entry.key.as_deref() == Some(&metadata.client_key_id))
+        {
             return Ok(None);
-        };
-        if entry.account != metadata.account_id {
+        }
+        let (id, entry) = entries
+            .iter()
+            .find(|(_, entry)| entry.request_id.as_deref() == Some(&metadata.request_id))
+            .ok_or_else(|| {
+                PluginFault::new(
+                    ErrorCode::Rejected,
+                    "Header test routing association is missing.",
+                )
+            })?;
+        if entry.cancelled
+            || entry.created.elapsed() >= LIFETIME
+            || entry.key.as_deref() != Some(&metadata.client_key_id)
+            || entry.account != metadata.account_id
+            || entry.provider != metadata.provider
+        {
             return Err(PluginFault::new(
                 ErrorCode::Rejected,
                 "Header test account does not match the selected account.",
             ));
         }
         Ok(Some(id.clone()))
+    }
+
+    /// 用随机测试标记关联普通模型请求，并指定所选账号的平台
+    /// @param call 宿主冻结的模型路由事实与原始正文
+    /// @return 测试专属路由，其余请求继续宿主路由
+    pub(crate) fn route(&self, call: &TypedCall<ModelRouteRequest>) -> ModelRouteDecision {
+        let Some(marker) = marker(&call.payload) else {
+            return ModelRouteDecision::Unhandled;
+        };
+        let mut entries = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(entry) = marker.as_str().and_then(|id| entries.get_mut(id)) else {
+            return ModelRouteDecision::Reject;
+        };
+        if entry.cancelled
+            || entry.created.elapsed() >= LIFETIME
+            || entry.key.is_none()
+            || entry.model != call.request.model
+            || !call.request.available_providers.contains(&entry.provider)
+            || entry
+                .request_id
+                .as_ref()
+                .is_some_and(|id| id != &call.request.request_id)
+        {
+            return ModelRouteDecision::Reject;
+        }
+        entry.request_id = Some(call.request.request_id.clone());
+        ModelRouteDecision::Route {
+            provider: Some(entry.provider.clone()),
+            model: None,
+        }
+    }
+
+    /// 将共享组的测试请求限定到管理员所选账号
+    /// @param request 本轮真实候选及租约可用性
+    /// @return 空闲时定向选号，繁忙时仅允许等待该账号
+    pub(crate) fn schedule(&self, request: &AccountScheduleRequest) -> AccountScheduleDecision {
+        let entries = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(entry) = entries
+            .values()
+            .find(|e| e.request_id.as_deref() == Some(&request.request_id))
+        else {
+            return AccountScheduleDecision::Delegate;
+        };
+        if entry.cancelled
+            || entry.created.elapsed() >= LIFETIME
+            || entry.provider != request.provider
+        {
+            return AccountScheduleDecision::Reject;
+        }
+        let Some(candidate) = request
+            .candidates
+            .iter()
+            .find(|c| c.account_id == entry.account)
+        else {
+            return AccountScheduleDecision::Reject;
+        };
+        if candidate.available {
+            AccountScheduleDecision::Pick {
+                account_id: entry.account.clone(),
+            }
+        } else {
+            AccountScheduleDecision::DelegateFiltered {
+                exclude_account_ids: request
+                    .candidates
+                    .iter()
+                    .filter(|c| c.account_id != entry.account)
+                    .map(|c| c.account_id.clone())
+                    .collect(),
+            }
+        }
+    }
+
+    /// 在资源准备及测试执行之外保存统一设置
+    /// @param call 当前管理员提交的设置
+    /// @return 新设置快照
+    pub(crate) async fn save_settings(
+        &self,
+        call: &TypedCall<ManagementRequest>,
+    ) -> Result<Value, PluginFault> {
+        let _guard = self.1.lock().await;
+        if self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .any(|e| !e.cancelled && e.created.elapsed() < LIFETIME)
+        {
+            return Err(PluginFault::new(
+                ErrorCode::Conflict,
+                "请先结束正在执行的测试",
+            ));
+        }
+        let input = serde_json::from_slice(&call.payload).map_err(|_| invalid())?;
+        serde_json::to_value(crate::test_settings::save(&call.host, input).await?)
+            .map_err(|_| invalid())
     }
 
     /// 保存当前中间件边界的前后对照，其他外层插件仍可能继续处理请求
@@ -302,7 +435,7 @@ impl Tests {
 async fn resources(
     call: &TypedCall<ManagementRequest>,
     account: &str,
-) -> Result<String, PluginFault> {
+) -> Result<(String, String), PluginFault> {
     let mut accounts = Vec::new();
     let mut cursor = None;
     loop {
@@ -322,69 +455,15 @@ async fn resources(
     }
     let selected = accounts
         .iter()
-        .find(|item| item.account_id == account)
+        .find(|a| a.account_id == account)
         .ok_or_else(|| PluginFault::new(ErrorCode::InvalidInput, "测试账号已不存在"))?;
     if !selected.enabled {
         return Err(PluginFault::new(ErrorCode::InvalidInput, "所选账号已停用"));
     }
-    let resource_key = format!("test.{account}");
-    let name = format!("请求头测试 {} {account}", call.context.instance_id);
-    let group = call
-        .host
-        .ensure_group(GroupEnsureRequest {
-            resource_key: resource_key.clone(),
-            name: name.clone(),
-            color: "#4477AAFF".into(),
-            description: Some("账号请求头插件的单账号测试范围".into()),
-        })
-        .await?;
-    if !group.enabled {
-        return Err(PluginFault::new(ErrorCode::InvalidInput, "测试分组已停用"));
-    }
-    if accounts
-        .iter()
-        .any(|item| item.account_id != account && item.group_ids.contains(&group.id))
-    {
-        return Err(PluginFault::new(
-            ErrorCode::InvalidInput,
-            "测试分组包含其他账号，请只保留所选账号",
-        ));
-    }
-    call.host
-        .change_group_members(GroupMembersChange {
-            resource_key: resource_key.clone(),
-            add: vec![account.into()],
-            remove: Vec::new(),
-        })
-        .await?;
-    let key = call
-        .host
-        .ensure_key(KeyEnsureRequest {
-            resource_key: resource_key.clone(),
-            name,
-            group_resource_keys: vec![resource_key],
-            max_concurrency: 1,
-            requests_per_minute: 0,
-            daily_limit_usd: "0".into(),
-            weekly_limit_usd: "0".into(),
-        })
-        .await?;
-    let facts = call
-        .host
-        .key_facts(ClientKeyFactsQuery {
-            client_key_id: key.id.clone(),
-        })
-        .await?;
-    if !key.enabled || !facts.enabled {
-        return Err(PluginFault::new(ErrorCode::InvalidInput, "测试 Key 已停用"));
-    }
-    if facts.group_ids != [group.id] {
-        return Err(PluginFault::new(
-            ErrorCode::InvalidInput,
-            "测试 Key 的分组范围已改变，请仅保留本账号的测试分组",
-        ));
-    }
-    Ok(key.id)
+    let key =
+        crate::test_settings::resources(&call.host, &call.context.instance_id, &accounts, selected)
+            .await?;
+    Ok((key, selected.provider_id.clone()))
 }
 
 fn valid_id(id: &str) -> bool {
@@ -392,4 +471,17 @@ fn valid_id(id: &str) -> bool {
 }
 fn invalid() -> PluginFault {
     PluginFault::new(ErrorCode::InvalidInput, "测试参数无效")
+}
+
+/// 普通请求先做字节筛选，测试请求才解析固定的元数据字段
+fn marker(body: &[u8]) -> Option<Value> {
+    const MARKER: &str = "cpr_account_headers_test";
+    if !body.windows(MARKER.len()).any(|w| w == MARKER.as_bytes()) {
+        return None;
+    }
+    serde_json::from_slice::<Value>(body)
+        .ok()?
+        .get_mut("metadata")?
+        .as_object_mut()?
+        .remove(MARKER)
 }

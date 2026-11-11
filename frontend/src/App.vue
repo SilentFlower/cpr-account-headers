@@ -7,6 +7,7 @@ import { computed, onBeforeUnmount, shallowRef } from 'vue'
 import { listAccounts } from './api/modules/headers'
 import AccountTest from './components/AccountTest.vue'
 import RuleEditor from './components/RuleEditor.vue'
+import TestSettings from './components/TestSettings.vue'
 
 const snapshot = shallowRef<AccountPage>()
 const loading = shallowRef(false)
@@ -18,7 +19,8 @@ const page = shallowRef(0)
 const selected = shallowRef<Account>()
 const editorOpen = shallowRef(false)
 const testerOpen = shallowRef(false)
-const modalOpen = computed(() => editorOpen.value || testerOpen.value)
+const settingsOpen = shallowRef(false)
+const modalOpen = computed(() => editorOpen.value || testerOpen.value || settingsOpen.value)
 const notice = shallowRef('')
 const rows = computed(() => snapshot.value?.accounts ?? [])
 const metrics = computed(() => [
@@ -148,6 +150,7 @@ function saved(value: RuleSnapshot) {
     <main class="space-y-4 text-z-text" :class="{ 'overflow-clip': modalOpen }" :style="modalOpen ? { maxHeight: 'var(--plugin-viewport-height, 100dvh)' } : undefined">
       <RuleEditor v-model="editorOpen" :account="selected" @saved="saved" />
       <AccountTest v-model="testerOpen" :account="selected" />
+      <TestSettings v-model="settingsOpen" @saved="notice = '测试设置已保存'" />
       <section aria-label="账号规则概览" class="grid grid-cols-3 gap-2 sm:gap-4">
         <ZCard v-for="metric in metrics" :key="metric.label">
           <p class="text-z-xs text-z-text-secondary sm:text-z-sm">
@@ -170,7 +173,10 @@ function saved(value: RuleSnapshot) {
           <ZButton type="primary" native-type="submit" :disabled="loading || modalOpen">
             查询
           </ZButton>
-          <ZButton :loading="loading" :disabled="modalOpen" class="sm:ml-auto" @click="load(page)">
+          <ZButton :disabled="modalOpen" class="sm:ml-auto" @click="settingsOpen = true">
+            测试设置
+          </ZButton>
+          <ZButton :loading="loading" :disabled="modalOpen" @click="load(page)">
             刷新
           </ZButton>
         </form>

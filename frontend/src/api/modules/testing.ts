@@ -22,7 +22,7 @@ export interface TestResult {
 }
 
 /**
- * 使用专用单账号 Key 从页面模型桥发请求，当前插件按普通链路参与
+ * 使用统一测试 Key 从页面模型桥发请求，当前插件按普通链路参与
  * @param id 随机测试编号
  * @param accountId 所选账号
  * @param modelId 模型标识
@@ -41,6 +41,7 @@ export async function testAccount(id: string, accountId: string, modelId: string
       clientKeyId: plan.clientKeyId,
       body: {
         model: modelId,
+        metadata: { cpr_account_headers_test: id },
         input: 'Reply with exactly OK.',
         stream: true,
         store: false,
@@ -167,4 +168,39 @@ async function readBody(response: Response, signal: AbortSignal): Promise<string
     offset += chunk.byteLength
   }
   return new TextDecoder().decode(bytes)
+}
+
+/** 当前插件实例的统一测试设置 */
+export interface SharedTestSettings { groupId: string | null, version: string | null }
+/** 可选择的原生分组 */
+export interface TestGroup { id: string, name: string, enabled: boolean }
+
+/**
+ * 读取统一设置及已有分组
+ * @return 设置版本与当前分组选择项
+ */
+export async function getTestSettings(): Promise<{ settings: SharedTestSettings, groups: TestGroup[] }> {
+  const value = await request('test/settings')
+  if (!isObject(value) || !isSettings(value.settings) || !Array.isArray(value.groups)
+    || !value.groups.every((item: unknown): item is TestGroup => isObject(item) && typeof item.id === 'string' && typeof item.name === 'string' && typeof item.enabled === 'boolean')) {
+    throw new Error('测试设置响应无效')
+  }
+  return { settings: value.settings, groups: value.groups }
+}
+
+/**
+ * 按读取版本保存统一测试设置
+ * @param settings 所选分组与精确版本，空分组使用自动模式
+ * @return 已确认的持久化设置
+ */
+export async function saveTestSettings(settings: SharedTestSettings): Promise<SharedTestSettings> {
+  const value = await request('test/settings', new URLSearchParams(), settings)
+  if (!isSettings(value))
+    throw new Error('保存结果待确认，请重新读取')
+  return value
+}
+
+function isSettings(value: unknown): value is SharedTestSettings {
+  return isObject(value) && (value.groupId === null || typeof value.groupId === 'string')
+    && (value.version === null || typeof value.version === 'string')
 }

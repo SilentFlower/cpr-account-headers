@@ -97,10 +97,10 @@ function stop() {
   <ZDialog v-model="open" title="测试请求头" :description="[account?.name || account?.account_id, account?.email && account.email !== account.name ? account.email : null].filter(Boolean).join(' · ')" width="52rem" :close-on-click-modal="false">
     <form id="account-headers-test" class="space-y-4" @submit.prevent="run">
       <p class="text-z-sm text-z-text-secondary">
-        自动准备本账号的专用测试分组和 Key，通过普通模型链路测试，最长等待 45 秒
+        使用统一测试分组和专用 Key，定向测试当前账号，最长等待 45 秒
       </p>
       <p class="text-z-xs text-z-text-secondary">
-        测试产生的模型用量计入专用 Key，测试资源会保留供下次复用
+        可在账号列表的「测试设置」中选择已有分组。留空时自动创建并复用共享分组
       </p>
       <ZFormItem label="上游模型 ID" for="probe-model">
         <ZInput id="probe-model" v-model="model" aria-label="上游模型 ID" placeholder="填写此账号支持的模型 ID" :disabled="!!active" maxlength="256" autocomplete="off" />

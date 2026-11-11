@@ -3,7 +3,7 @@
   "publisher": "silentflower",
   "name": "account-headers",
   "displayName": "账号请求头",
-  "version": "0.1.6",
+  "version": "0.2.0",
   "description": "按账号自定义覆写模型上游请求头",
   "license": "Apache-2.0",
   "engines": { "codex-proxy-rs": ">=3.43.0" },
@@ -19,10 +19,13 @@
   },
   "contributes": {
     "middleware": { "version": 6, "stages": ["outbound"], "inputFormats": ["openai"], "outputFormats": ["openai"] },
-    "management": { "version": 2 }
+    "management": { "version": 2 },
+    "model_router": { "version": 2 },
+    "scheduler": { "version": 3 }
   },
   "configurationSchema": { "type": "object", "properties": {}, "additionalProperties": false },
   "state": [
+    { "namespace": "testing", "schemaVersion": 1, "schema": { "type": "object" }, "maximumRecords": 1, "maximumBytes": 4096, "maximumValueBytes": 4096 },
     { "namespace": "headers", "schemaVersion": 1, "schema": { "type": "object" }, "maximumRecords": 10000, "maximumBytes": 16777216, "maximumValueBytes": 65536 }
   ]
 }

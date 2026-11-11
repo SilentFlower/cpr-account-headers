@@ -24,6 +24,7 @@ use serde_json::{Value, from_slice, json, to_value, to_vec};
 use crate::{
     host_json,
     store::{self, Snapshot},
+    test_settings,
     testing::Tests,
 };
 
@@ -49,6 +50,8 @@ pub(crate) fn registration() -> ManagementRegistration {
             ("POST", "test/cancel"),
             ("POST", "test/finish"),
             ("GET", "test"),
+            ("GET", "test/settings"),
+            ("POST", "test/settings"),
         ]
         .into_iter()
         .map(|(method, path)| ManagementRoute {
@@ -137,6 +140,15 @@ async fn route(call: &TypedCall<ManagementRequest>, tests: &Tests) -> Result<Val
         }
     }
     match (call.request.method.as_str(), call.request.path.as_str()) {
+        ("GET", "test/settings") if query.is_empty() => {
+            let (settings, groups) = tokio::try_join!(
+                test_settings::load(&call.host),
+                test_settings::groups(&call.host)
+            )?;
+            Ok(json!({"settings":settings,"groups":groups}))
+        }
+        ("POST", "test/settings") if query.is_empty() => tests.save_settings(call).await,
+
         ("GET", "accounts") if query.keys().all(|key| key == "cursor" || key == "search") => {
             accounts(
                 call,
