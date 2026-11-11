@@ -3,6 +3,9 @@
 /** 固定到当前实例与制品的宿主桥 */
 interface PluginBridge {
   readonly version: 2
+  readonly models?: {
+    responses: (input: { clientKeyId: string, body: Record<string, unknown>, signal?: AbortSignal }) => Promise<Response>
+  }
   request: (input: { method: 'GET' | 'POST', path: string, query: string, contentType?: string, body?: string }) => Promise<{ status: number, contentType: string, body: ArrayBuffer }>
 }
 

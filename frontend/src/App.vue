@@ -137,7 +137,7 @@ function saved(value: RuleSnapshot) {
           </ZButton>
         </form>
         <p class="mt-3 text-z-sm text-z-text-secondary">
-          点击“测试”可查看此账号经过出站插件后的 UA 和 originator
+          点击“测试”可查看此账号在普通模型链路中覆写前后的请求头
         </p>
       </ZCard>
       <ZCard>

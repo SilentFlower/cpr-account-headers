@@ -27,9 +27,9 @@ struct Host {
     fail_next: bool,
     cancel_next: bool,
     id: u64,
-    http_status: u16,
-    http_body: Vec<u8>,
-    dispatch_count: usize,
+    resource_calls: usize,
+    extra_member: bool,
+    changed_key_scope: bool,
 }
 
 impl Host {
@@ -51,9 +51,9 @@ impl Host {
             fail_next: false,
             cancel_next: false,
             id: 0,
-            http_status: 200,
-            http_body: Vec::new(),
-            dispatch_count: 0,
+            resource_calls: 0,
+            extra_member: false,
+            changed_key_scope: false,
         };
         let manifest = Manifest::from_author_slice(include_bytes!("../plugin.json")).unwrap();
         host.send(
@@ -175,27 +175,43 @@ impl Host {
                             let second = query["cursor"] == "next-page";
                             payload = serde_json::to_vec(&json!({"schema_version":1,"accounts":[{
                                 "account_id":if second {OTHER} else {ACCOUNT},"provider_id":"openai","name":"测试账号","email":null,
-                                "enabled":true,"group_ids":[],"updated_at_ms":0
+                                "enabled":true,"group_ids":if second && self.extra_member {vec!["grp_11111111111111111111111111111111"]} else {vec![]},"updated_at_ms":0
                             }],"next_cursor":if second {None} else {Some("next-page")}})).unwrap();
                             Ok(json!({}))
                         }
-                        "host.http.dispatch" => {
-                            self.dispatch_count += 1;
-                            assert_eq!(params["method"], "GET");
-                            let uri = params["uri"].as_str().unwrap();
-                            assert!(uri.starts_with("/api/admin/accounts/connection-test?"));
-                            assert!(uri.contains("outboundPlugins=true"));
-                            assert!(uri.contains(ACCOUNT));
-                            assert!(uri.contains("modelId=test-model"));
-                            assert_eq!(params["headers"], json!([]));
-                            Ok(
-                                json!({"status":self.http_status,"version":"HTTP/1.1","headers":[],"body":{"kind":"handle","handle":"probe-body"},"response":null,"session":false}),
-                            )
-                        }
-                        "host.http.body_read" => {
-                            assert_eq!(params["handle"], "probe-body");
-                            payload = std::mem::take(&mut self.http_body);
-                            Ok(json!({"eof":payload.is_empty(),"trailers":null}))
+                        "host.groups.ensure"
+                        | "host.groups.change_members"
+                        | "host.keys.ensure"
+                        | "host.data.keys.get" => {
+                            assert_eq!(params, json!({}));
+                            let query: Value = serde_json::from_slice(&frame.payload).unwrap();
+                            self.resource_calls += 1;
+                            let value = match method.as_str() {
+                                "host.groups.ensure" => {
+                                    assert_eq!(query["resource_key"], format!("test.{ACCOUNT}"));
+                                    json!({"id":"grp_11111111111111111111111111111111","name":"测试分组","enabled":true})
+                                }
+                                "host.groups.change_members" => {
+                                    assert_eq!(query["add"], json!([ACCOUNT]));
+                                    assert_eq!(query["remove"], json!([]));
+                                    json!({"added":1,"removed":0})
+                                }
+                                "host.keys.ensure" => {
+                                    assert_eq!(
+                                        query["group_resource_keys"],
+                                        json!([format!("test.{ACCOUNT}")])
+                                    );
+                                    assert_eq!(query["max_concurrency"], 1);
+                                    json!({"id":"key","name":"测试 Key","enabled":true})
+                                }
+                                "host.data.keys.get" => {
+                                    assert_eq!(query["client_key_id"], "key");
+                                    json!({"schema_version":1,"client_key_id":"key","enabled":true,"group_ids":[if self.changed_key_scope {"grp_22222222222222222222222222222222"} else {"grp_11111111111111111111111111111111"}]})
+                                }
+                                _ => unreachable!(),
+                            };
+                            payload = serde_json::to_vec(&value).unwrap();
+                            Ok(json!({}))
                         }
                         "host.middleware.next" => {
                             self.next_count += 1;
@@ -360,81 +376,123 @@ async fn failures_and_cancel_keep_session_usable_without_replaying_next() {
 }
 
 #[tokio::test]
-async fn account_tests_require_matching_evidence_and_keep_upstream_errors() {
-    let mut host = Host::start(State::new()).await;
-    let evidence = json!({"type":"outbound_request","accountId":ACCOUNT,"requestId":"req_probe","transport":"http","headers":[{"name":"user-agent","value":"fixture-agent"}]});
-    for (account, complete, error, expected) in [
-        (ACCOUNT, true, false, "success"),
-        (OTHER, true, false, "unsupported"),
-        (ACCOUNT, false, false, "unsupported"),
-        (ACCOUNT, false, true, "failed"),
-    ] {
-        let mut event = evidence.clone();
-        event["accountId"] = json!(account);
-        let mut stream = format!("data: {event}\r\n\r\n");
-        if complete {
-            stream.push_str("data: {\"type\":\"test_complete\",\"success\":true}\n\n");
-        }
-        if error {
-            stream.push_str("data: {\"type\":\"error\",\"error\":\"fixture failure\",\"sendState\":\"not_sent\"}\n\n");
-        }
-        host.http_body = stream.into_bytes();
-        let (status, result) = host
-            .management(
-                "POST",
-                "test",
-                "",
-                json!({"id":"a".repeat(32),"accountId":ACCOUNT,"modelId":"test-model"}),
-            )
-            .await;
-        assert_eq!(status, 200);
-        assert_eq!(result["status"], expected);
-        if error {
-            assert_eq!(result["message"], "fixture failure");
-            assert_eq!(result["error"]["sendState"], "not_sent");
-            assert_eq!(
-                result["outbound"][0]["headers"][0]["value"],
-                "fixture-agent"
-            );
-        }
-    }
-    host.http_status = 400;
-    host.http_body = b"unknown field outboundPlugins".to_vec();
-    let (_, result) = host
-        .management(
-            "POST",
-            "test",
-            "",
-            json!({"id":"a".repeat(32),"accountId":ACCOUNT,"modelId":"test-model"}),
-        )
-        .await;
-    assert_eq!(result["status"], "unsupported");
-    let before = host.dispatch_count;
-    assert_eq!(
-        host.management("POST", "test/cancel", "", json!({"id":"b".repeat(32)}))
-            .await
-            .0,
-        200
-    );
-    let (_, result) = host
-        .management(
-            "POST",
-            "test",
-            "",
-            json!({"id":"b".repeat(32),"accountId":ACCOUNT,"modelId":"test-model"}),
-        )
-        .await;
-    assert_eq!(result["status"], "cancelled");
-    assert_eq!(host.dispatch_count, before);
+async fn account_tests_use_owned_single_account_scope_and_real_outbound_records() {
+    let mut host = Host::start(State::from([(ACCOUNT.into(), (json!({"enabled":true,"headers":[{"name":"user-agent","value":"fixture-agent"},{"name":"originator","value":"pi"}]}),1))])).await;
+    let id = "a".repeat(32);
+    let input = json!({"id":id,"accountId":ACCOUNT,"modelId":"test-model"});
+    let (status, plan) = host.management("POST", "test", "", input.clone()).await;
+    assert_eq!(status, 200);
+    assert_eq!(plan["clientKeyId"], "key");
+    assert_eq!(host.resource_calls, 4);
     assert_eq!(
         host.management(
             "POST",
             "test",
             "",
-            json!({"id":"invalid","accountId":ACCOUNT,"modelId":"test-model"})
+            json!({"id":"b".repeat(32),"accountId":ACCOUNT,"modelId":"test-model"})
         )
         .await
         .0,
+        409
+    );
+    let error = host
+        .outbound(OTHER, false, b"wrong-account")
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Rejected);
+    assert_eq!(host.next_count, 0);
+    for websocket in [false, true] {
+        let (head, body) = host
+            .outbound(ACCOUNT, websocket, b"real-request")
+            .await
+            .unwrap();
+        assert_eq!(body, b"real-request");
+        assert_eq!(
+            head["headers"][1]["value"],
+            json!(b"fixture-agent".to_vec())
+        );
+    }
+    let query = format!("id={id}&requestId=request");
+    let (status, captured) = host.management("GET", "test", &query, Value::Null).await;
+    assert_eq!(status, 200);
+    let records = captured["outbound"].as_array().unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["accountId"], ACCOUNT);
+    assert_eq!(
+        records[0]["beforeHeaders"],
+        json!([{"name":"User-Agent","value":"original"}])
+    );
+    assert_eq!(
+        records[0]["headers"],
+        json!([{"name":"user-agent","value":"fixture-agent"},{"name":"originator","value":"pi"}])
+    );
+    assert_eq!(records[1]["transport"], "websocket");
+    let (_, other) = host
+        .management(
+            "GET",
+            "test",
+            &format!("id={id}&requestId=other-request"),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(other["outbound"], json!([]));
+    assert_eq!(
+        host.management("POST", "test/finish", "", json!({"id":id}))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        host.management("GET", "test", &query, Value::Null).await.0,
         400
+    );
+    assert_eq!(host.management("POST", "test", "", input).await.0, 200);
+}
+
+#[tokio::test]
+async fn account_tests_reject_changed_resource_scope_and_handle_early_cancel() {
+    let mut host = Host::start(State::new()).await;
+    let id = "a".repeat(32);
+    let input = json!({"id":id,"accountId":ACCOUNT,"modelId":"test-model"});
+    host.extra_member = true;
+    let (status, error) = host.management("POST", "test", "", input.clone()).await;
+    assert_eq!(status, 400);
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("其他账号")
+    );
+    assert_eq!(host.resource_calls, 1);
+    host.extra_member = false;
+    host.changed_key_scope = true;
+    let (status, error) = host.management("POST", "test", "", input.clone()).await;
+    assert_eq!(status, 400);
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("分组范围")
+    );
+    host.changed_key_scope = false;
+    assert_eq!(
+        host.management("POST", "test/cancel", "", json!({"id":id}))
+            .await
+            .0,
+        200
+    );
+    let before = host.resource_calls;
+    assert_eq!(host.management("POST", "test", "", input).await.0, 409);
+    assert_eq!(host.resource_calls, before);
+    assert_eq!(
+        host.management(
+            "POST",
+            "test",
+            "",
+            json!({"id":"b".repeat(32),"accountId":ACCOUNT,"modelId":"test-model"})
+        )
+        .await
+        .0,
+        200
     );
 }

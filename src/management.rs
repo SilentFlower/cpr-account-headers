@@ -42,6 +42,8 @@ pub(crate) fn registration() -> ManagementRegistration {
             ("POST", "rule"),
             ("POST", "test"),
             ("POST", "test/cancel"),
+            ("POST", "test/finish"),
+            ("GET", "test"),
         ]
         .into_iter()
         .map(|(method, path)| ManagementRoute {
@@ -88,12 +90,19 @@ pub(crate) async fn handle(
                 ErrorCode::InvalidInput => 400,
                 ErrorCode::Conflict => 409,
                 ErrorCode::Rejected => 404,
+                ErrorCode::Cancelled => 409,
+                ErrorCode::Timeout => 408,
                 _ => 503,
             };
             let message = match error.code {
-                ErrorCode::Conflict if call.request.path.starts_with("test") => &error.message,
+                ErrorCode::Conflict | ErrorCode::Cancelled | ErrorCode::Timeout
+                    if call.request.path.starts_with("test") =>
+                {
+                    &error.message
+                }
                 ErrorCode::Conflict => "规则已被其他页面更新，请重新读取后编辑",
                 ErrorCode::InvalidInput => &error.message,
+                _ if call.request.path.starts_with("test") => "测试资源准备失败",
                 _ => "账号请求头操作失败，请重新读取确认当前规则",
             };
             (
@@ -144,8 +153,13 @@ async fn route(call: &TypedCall<ManagementRequest>, tests: &Tests) -> Result<Val
             }
             to_value(store::save(&call.host, input).await?).map_err(|_| invalid())
         }
-        ("POST", "test") if query.is_empty() => tests.run(call).await,
-        ("POST", "test/cancel") if query.is_empty() => tests.cancel(call),
+        ("POST", "test") if query.is_empty() => tests.prepare(call).await,
+        ("POST", "test/cancel") if query.is_empty() => tests.end(call, true),
+        ("POST", "test/finish") if query.is_empty() => tests.end(call, false),
+        ("GET", "test") if query.len() == 2 => tests.result(
+            &query.remove("id").ok_or_else(invalid)?,
+            &query.remove("requestId").ok_or_else(invalid)?,
+        ),
         _ => Err(invalid()),
     }
 }
